@@ -1479,24 +1479,25 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
     # Bereite Daten für Bulk-Upload vor
     bulk_data = []
     for q in questions:
-        # Stelle sicher, dass alle nötigen Felder vorhanden sind
-        if "question" not in q:
-            parse_question_details(q)
+        # Die Struktur kommt jetzt von formatted_questions, parse_question_details ist hier nicht mehr nötig
+        # (wurde bereits in process_pdf angewendet)
             
         # Sicherstellen, dass alle Werte Strings sind
+        options_dict = q.get("options", {}) # Hole das verschachtelte Optionen-Dict
+
         data = {
             "id": str(q.get("id", uuid.uuid4())),
             "exam_name": str(exam_name or ""),
             "exam_year": str(exam_year or ""),
             "exam_semester": str(exam_semester or ""),
             "question": str(q.get("question", "")),
-            "option_a": str(q.get("option_a", "")),
-            "option_b": str(q.get("option_b", "")),
-            "option_c": str(q.get("option_c", "")),
-            "option_d": str(q.get("option_d", "")),
-            "option_e": str(q.get("option_e", "")),
+            "option_a": str(options_dict.get("A", "")), # Zugriff über options_dict
+            "option_b": str(options_dict.get("B", "")), # Zugriff über options_dict
+            "option_c": str(options_dict.get("C", "")), # Zugriff über options_dict
+            "option_d": str(options_dict.get("D", "")), # Zugriff über options_dict
+            "option_e": str(options_dict.get("E", "")), # Zugriff über options_dict
             "subject": str(q.get("subject", "")),
-            "correct_answer": str(q.get("correct_answer", "")),
+            "correct_answer": str(q.get("correctAnswer", "")), # Beachte: Key ist hier correctAnswer
             "comment": str(q.get("comment", "")),
             "image_key": str(q.get("image_key", "")),
             "filename": pdf_filename,
