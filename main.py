@@ -122,14 +122,15 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
         if not questions:
             logger.warning("Keine Fragen im PDF gefunden")
             return {
-                "status": "warning",
-                "success": False,
+                "status": "completed",  # Status ist abgeschlossen, auch wenn nichts gefunden wurde
+                "success": False, # Explizit als nicht erfolgreich markieren
                 "message": "Keine Fragen im PDF gefunden",
                 "data": {
                     "exam_name": exam_name,
                     "questions_processed": 0,
                     "images_uploaded": 0,
-                }
+                },
+                "questions": [] # Leere Liste für Konsistenz
             }
             
         # Verarbeite alle Fragen parallel mit Batch-Verarbeitung für bessere Performance
@@ -382,7 +383,7 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
             formatted_questions.append(formatted_question)
 
         return {
-            "status": "success",
+            "status": "completed", # Konsistent "completed" verwenden
             "success": True,  # Für Frontend-Kompatibilität
             "data": {
                 "exam_name": exam_name,
@@ -396,7 +397,7 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
     except Exception as e:
         logger.error(f"Fehler bei der PDF-Verarbeitung: {str(e)}")
         return {
-            "status": "error",
+            "status": "failed", # Konsistent "failed" verwenden
             "success": False,  # Für Frontend-Kompatibilität
             "message": str(e),
             "data": {},
