@@ -695,6 +695,7 @@ async def upload_pdf(
         logger.info(f"Datei erfolgreich gespeichert: {os.path.getsize(temp_file_path)} Bytes")
 
         config = Config()
+        global processing_tasks # Declare processing_tasks as global
         
         # Erstelle ein Metadaten-Wörterbuch für die PDF-Verarbeitung
         metadata = {
@@ -765,6 +766,7 @@ async def check_task_status(task_id: str) -> JSONResponse:
     Gibt den aktuellen Status und ggf. die Ergebnisse zurück.
     """
     logger.info(f"Status-Abfrage für Task: {task_id}")
+    global processing_tasks # Declare processing_tasks as global
     
     if task_id in processing_tasks:
         task_status = processing_tasks[task_id]
@@ -803,6 +805,7 @@ async def process_pdf_in_background(task_id: str, pdf_path: str, config: Config,
     Verarbeitet das PDF im Hintergrund und aktualisiert den Task-Status.
     """
     try:
+        global processing_tasks # Declare processing_tasks as global
         logger.info(f"Starte Hintergrundverarbeitung für Task {task_id}: {pdf_path}")
         
         # 1. Verarbeite die PDF-Datei (Extraktion, Bild-Upload)
@@ -1694,6 +1697,6 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        workers=4,
+        workers=1,
         log_level="info"
     )
