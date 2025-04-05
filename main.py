@@ -33,6 +33,9 @@ app = FastAPI(title="Exam PDF Processor", version="1.0.0")
 # Lade .env Datei beim Start
 load_dotenv()
 
+# --- Globaler In-Memory Speicher für Task-Status (NUR FÜR workers=1 geeignet!) ---
+processing_tasks = {}
+
 # Globale Variable für Dateinamen
 current_pdf_filename = ""
 
