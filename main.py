@@ -8,7 +8,7 @@ import boto3
 import os
 import asyncio
 import concurrent.futures
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, status, Body, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, status, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 import uvicorn
 from supabase import create_client, Client
@@ -19,6 +19,7 @@ import tempfile
 from urllib.parse import urlparse
 from datetime import datetime
 import hashlib
+import traceback
 
 # Logging Konfiguration
 logging.basicConfig(
@@ -34,9 +35,6 @@ load_dotenv()
 
 # Globale Variable für Dateinamen
 current_pdf_filename = ""
-
-# In-Memory-Speicher für Aufgabenstatus (in Produktion sollte dies durch eine Datenbank ersetzt werden)
-processing_tasks = {}
 
 # Verbesserte Konfigurationsklasse
 class Config:
@@ -629,6 +627,8 @@ async def upload_pdf(
     examYear: str = Form(""),
     examSemester: str = Form(""),
     subject: str = Form(""),
+    userId: str = Form(""), # Receive userId
+    visibility: str = Form("private"), # Receive visibility, default to private
     background_tasks: BackgroundTasks = None
 ) -> JSONResponse:
     global current_pdf_filename
@@ -701,7 +701,9 @@ async def upload_pdf(
             "exam_name": examName,
             "exam_year": examYear,
             "exam_semester": examSemester,
-            "subject": subject
+            "subject": subject,
+            "user_id": userId, # Pass userId to metadata
+            "visibility": visibility # Pass visibility to metadata
         }
         
         # Erstelle eine Task-ID für das Tracking
@@ -803,31 +805,100 @@ async def process_pdf_in_background(task_id: str, pdf_path: str, config: Config,
     try:
         logger.info(f"Starte Hintergrundverarbeitung für Task {task_id}: {pdf_path}")
         
-        # Verarbeite die PDF-Datei
-        result = await process_pdf(pdf_path, config, metadata)
+        # 1. Verarbeite die PDF-Datei (Extraktion, Bild-Upload)
+        processing_result = await process_pdf(pdf_path, config, metadata)
         
-        # Aktualisiere den Status auf abgeschlossen
-        processing_tasks[task_id] = {
-            "status": "completed",
-            "message": "Verarbeitung abgeschlossen",
-            "questions": result.get("questions", []),
-            "data": result.get("data", {})
-        }
-        
-        logger.info(f"Hintergrundverarbeitung für Task {task_id} abgeschlossen")
-        
+        # 2. Prüfe Ergebnis der Verarbeitung
+        if processing_result.get("status") == "completed" and processing_result.get("success") == True:
+            logger.info(f"PDF Verarbeitung für Task {task_id} erfolgreich. Starte DB Insert.")
+            formatted_questions = processing_result.get("questions", [])
+            processing_data = processing_result.get("data", {})
+
+            if not formatted_questions:
+                # Fall: Verarbeitung erfolgreich, aber keine Fragen gefunden
+                logger.warning(f"Task {task_id}: PDF verarbeitet, aber keine Fragen gefunden.")
+                processing_tasks[task_id] = {
+                    "status": "completed",
+                    "success": False, # Nicht erfolgreich, da nichts zu speichern
+                    "message": "PDF verarbeitet, aber keine Fragen gefunden.",
+                    "data": processing_data
+                }
+            else:
+                try:
+                    # 3. Füge extrahierte Fragen in die DB ein
+                    exam_name = metadata.get("exam_name", processing_data.get("exam_name", "Unknown"))
+                    exam_year = metadata.get("exam_year", "")
+                    exam_semester = metadata.get("exam_semester", "")
+                    user_id = metadata.get("user_id", None) # Get userId from metadata
+                    visibility = metadata.get("visibility", "private") # Get visibility
+
+                    successful_inserts, failed_inserts = insert_questions_into_db(
+                        formatted_questions, exam_name, exam_year, exam_semester, user_id, visibility, config
+                    )
+
+                    # 4. Aktualisiere Task-Status basierend auf DB-Ergebnis
+                    if failed_inserts == 0 and successful_inserts > 0:
+                        logger.info(f"Task {task_id}: {successful_inserts} Fragen erfolgreich in DB gespeichert.")
+                        processing_tasks[task_id] = {
+                            "status": "completed",
+                            "success": True,
+                            "message": f"{successful_inserts} Fragen erfolgreich verarbeitet und gespeichert.",
+                            "data": processing_data # Behalte Verarbeitungs-Stats
+                        }
+                    elif successful_inserts > 0 and failed_inserts > 0:
+                        logger.warning(f"Task {task_id}: DB Insert teilweise erfolgreich ({successful_inserts} OK, {failed_inserts} Failed).")
+                        processing_tasks[task_id] = {
+                            "status": "completed", # Abgeschlossen, aber nicht voll erfolgreich
+                            "success": False, 
+                            "message": f"Verarbeitung abgeschlossen, aber nur {successful_inserts} von {len(formatted_questions)} Fragen konnten gespeichert werden.",
+                            "data": processing_data
+                        }
+                    else: # failed_inserts > 0 and successful_inserts == 0
+                        logger.error(f"Task {task_id}: DB Insert komplett fehlgeschlagen ({failed_inserts} Failed).")
+                        processing_tasks[task_id] = {
+                            "status": "failed", # Fehler beim Speichern
+                            "success": False,
+                            "message": "PDF verarbeitet, aber Speichern der Fragen fehlgeschlagen.",
+                            "data": processing_data
+                        }
+                except Exception as db_error:
+                    logger.error(f"Fehler beim DB Insert für Task {task_id}: {str(db_error)}")
+                    processing_tasks[task_id] = {
+                        "status": "failed",
+                        "success": False,
+                        "message": f"Fehler beim Speichern der Fragen in der Datenbank: {str(db_error)}",
+                        "data": processing_result.get("data", {}) 
+                    }
+
+        elif processing_result.get("status") == "completed" and processing_result.get("success") == False:
+            # Fall: Verarbeitung selbst war nicht erfolgreich (z.B. keine Fragen gefunden in process_pdf)
+            logger.warning(f"Task {task_id}: PDF Verarbeitung abgeschlossen, aber nicht erfolgreich.")
+            processing_tasks[task_id] = {
+                "status": "completed",
+                "success": False,
+                "message": processing_result.get("message", "PDF Verarbeitung nicht erfolgreich."),
+                "data": processing_result.get("data", {})
+            }
+        else: # Verarbeitungsfehler (status: failed)
+            logger.error(f"PDF Verarbeitung für Task {task_id} fehlgeschlagen.")
+            processing_tasks[task_id] = {
+                "status": "failed",
+                "success": False,
+                "message": processing_result.get("message", "Fehler bei der PDF-Verarbeitung."),
+                "data": processing_result.get("data", {})
+            }
+            
     except Exception as e:
-        logger.error(f"Fehler bei der Hintergrundverarbeitung von Task {task_id}: {str(e)}")
-        
+        logger.error(f"Schwerwiegender Fehler bei der Hintergrundverarbeitung von Task {task_id}: {str(e)}")
         # Aktualisiere den Status auf Fehler
         processing_tasks[task_id] = {
-            "status": "error",
+            "status": "failed", # Konsistent "failed" verwenden
+            "success": False,
             "message": f"Fehler bei der Verarbeitung: {str(e)}",
             "data": {
                 "error_details": str(e)
             }
-        }
-        
+         }
         # Eventuelle Aufräumarbeiten durchführen
 
 async def cleanup_temp_file(file_path: str, delay_seconds: int = 0):
@@ -1381,7 +1452,7 @@ def map_images_to_questions(questions, images):
         logger.error(traceback.format_exc())
         return images
 
-def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, config):
+def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, user_id, visibility, config):
     """
     Fügt Fragen in Supabase im Bulk-Modus ein für bessere Performance
     """
@@ -1423,6 +1494,8 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, con
             "comment": str(q.get("comment", "")),
             "image_key": str(q.get("image_key", "")),
             "filename": pdf_filename,
+            "user_id": str(user_id) if user_id else None, # Add user_id
+            "visibility": str(visibility) # Add visibility
         }
         bulk_data.append(data)
     
@@ -1577,7 +1650,7 @@ def main(pdf_path):
                         break
 
         # Fragen in Supabase speichern
-        insert_questions_into_db(questions, exam_name, exam_year, exam_semester, config)
+        insert_questions_into_db(questions, exam_name, exam_year, exam_semester, None, "private", config)
         
         return {
             "status": "success", 
@@ -1615,105 +1688,6 @@ def analyze_pdf_structure(pdf_path):
                 logger.info(f"{name}: {len(matches)} Treffer - Beispiele: {matches[:3]}")
     
     return {"pages": len(doc), "analyzed_samples": sample_pages}
-
-@app.post("/save-questions", 
-    summary="Speichert bearbeitete Fragen in der Datenbank",
-    response_description="Speicherungsstatus und Details")
-async def save_questions(
-    questions: List[Dict] = Body(...),
-    exam_name: str = Body(""),
-    exam_year: str = Body(""),
-    exam_semester: str = Body("")
-) -> JSONResponse:
-    try:
-        logger.info(f"Speichere {len(questions)} bearbeitete Fragen in Supabase")
-        
-        # Validiere Metadaten
-        if not exam_name:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={
-                    "status": "error",
-                    "success": False,
-                    "message": "Prüfungsname ist erforderlich",
-                    "data": {}
-                }
-            )
-        
-        # Formatiere die Fragen in das Format für die Datenbank
-        db_questions = []
-        for q in questions:
-            options = q.get("options", {})
-            
-            # Verwende Frageninterne Werte oder Fallback auf globale Metadaten
-            question_year = q.get("year", exam_year)
-            question_semester = q.get("semester", exam_semester)
-            question_subject = q.get("subject", subject)
-            
-            db_question = {
-                "id": q.get("id", str(uuid.uuid4())),
-                "exam_name": exam_name,
-                "exam_year": question_year,
-                "exam_semester": question_semester,
-                "question": q.get("question", ""),
-                "option_a": options.get("A", ""),
-                "option_b": options.get("B", ""),
-                "option_c": options.get("C", ""),
-                "option_d": options.get("D", ""),
-                "option_e": options.get("E", ""),
-                "subject": question_subject,
-                "correct_answer": q.get("correctAnswer", ""),
-                "comment": q.get("comment", ""),
-                "image_key": q.get("image_key", ""),
-                "filename": current_pdf_filename,
-            }
-            db_questions.append(db_question)
-        
-        # Konfiguration initialisieren
-        config = Config()
-        
-        # Speichere Fragen in Supabase mit der vorhandenen Funktion
-        try:
-            successful_questions, failed_questions = insert_questions_into_db(
-                db_questions, exam_name, exam_year, exam_semester, config
-            )
-            
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content={
-                    "status": "success",
-                    "success": True,
-                    "message": f"{successful_questions} Fragen erfolgreich gespeichert, {failed_questions} fehlgeschlagen",
-                    "data": {
-                        "questions_processed": successful_questions,
-                        "questions_failed": failed_questions,
-                        "total_questions": len(questions)
-                    }
-                }
-            )
-        except Exception as e:
-            logger.error(f"Fehler beim Einfügen in die Datenbank: {str(e)}")
-            return JSONResponse(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                content={
-                    "status": "error",
-                    "success": False,
-                    "message": f"Fehler beim Speichern in der Datenbank: {str(e)}",
-                    "data": {}
-                }
-            )
-    
-    except Exception as e:
-        logger.error(f"Fehler bei der Verarbeitung der bearbeiteten Fragen: {str(e)}")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "status": "error",
-                "success": False,
-                "message": str(e),
-                "data": {}
-            }
-        )
 
 if __name__ == "__main__":
     uvicorn.run(
