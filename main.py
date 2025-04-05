@@ -35,6 +35,9 @@ load_dotenv()
 # Globale Variable für Dateinamen
 current_pdf_filename = ""
 
+# In-Memory-Speicher für Aufgabenstatus (in Produktion sollte dies durch eine Datenbank ersetzt werden)
+processing_tasks = {}
+
 # Verbesserte Konfigurationsklasse
 class Config:
     def __init__(self):
@@ -700,39 +703,43 @@ async def upload_pdf(
             "subject": subject
         }
         
+        # Erstelle eine Task-ID für das Tracking
+        task_id = str(uuid.uuid4())
+        
+        # Initialisiere den Task-Status
+        processing_tasks[task_id] = {
+            "status": "processing",
+            "message": "PDF-Verarbeitung gestartet",
+            "data": {
+                "exam_name": examName,
+                "filename": file.filename
+            }
+        }
+        
         # Im asynchronen Modus starten wir die Verarbeitung im Hintergrund
         # und geben sofort eine Antwort zurück
-        if background_tasks:
-            # Bei Hintergrundverarbeitung kann keine Vorschau zurückgegeben werden
-            # Dieser Pfad sollte nur für die Legacy-API verwendet werden
-            background_tasks.add_task(process_pdf, temp_file_path, config, metadata)
-            # Verzögere das Löschen der Datei - Task-ID hinzufügen
-            task_id = str(uuid.uuid4())
-            logger.info(f"Hintergrundaufgabe gestartet: {task_id}")
-            
-            # Verzögertes Löschen hinzufügen (nach 1 Stunde)
-            background_tasks.add_task(cleanup_temp_file, temp_file_path, 3600)
-            
-            return JSONResponse(
-                status_code=status.HTTP_202_ACCEPTED,
-                content={
-                    "status": "accepted",
-                    "message": "PDF-Verarbeitung gestartet",
-                    "task_id": task_id
-                }
-            )
-        else:
-            # Im synchronen Modus verarbeiten wir die PDF und geben die Vorschaudaten zurück
-            try:
-                # Verarbeite PDF synchron und gib Daten direkt zurück (für Vorschau)
-                result = await process_pdf(temp_file_path, config, metadata)
-                return JSONResponse(
-                    status_code=status.HTTP_200_OK,
-                    content=result
-                )
-            finally:
-                # Aufräumen nach der Verarbeitung
-                cleanup_temp_file(temp_file_path, 0)
+        background_tasks.add_task(
+            process_pdf_in_background, 
+            task_id, 
+            temp_file_path, 
+            config, 
+            metadata
+        )
+        
+        # Verzögere das Löschen der Datei
+        background_tasks.add_task(cleanup_temp_file, temp_file_path, 3600)
+        
+        logger.info(f"Hintergrundaufgabe gestartet: {task_id}")
+        
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "success": True,
+                "status": "processing",
+                "message": "PDF-Verarbeitung gestartet",
+                "task_id": task_id
+            }
+        )
 
     except HTTPException as he:
         raise he
@@ -742,6 +749,85 @@ async def upload_pdf(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+@app.get("/status/{task_id}", 
+    summary="Prüft den Status einer Verarbeitungsaufgabe",
+    response_description="Status einer PDF-Verarbeitungsaufgabe")
+async def check_task_status(task_id: str) -> JSONResponse:
+    """
+    Prüft den Status einer Verarbeitungsaufgabe anhand der Task-ID.
+    
+    - task_id: Die eindeutige ID der Aufgabe
+    
+    Gibt den aktuellen Status und ggf. die Ergebnisse zurück.
+    """
+    logger.info(f"Status-Abfrage für Task: {task_id}")
+    
+    if task_id in processing_tasks:
+        task_status = processing_tasks[task_id]
+        
+        # Bereite die Antwort vor
+        response_content = {
+            "success": task_status["status"] != "error",
+            "status": task_status["status"],
+            "message": task_status["message"]
+        }
+        
+        # Füge Fragen und Daten hinzu, wenn verfügbar
+        if "questions" in task_status:
+            response_content["questions"] = task_status["questions"]
+        
+        if "data" in task_status:
+            response_content["data"] = task_status["data"]
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=response_content
+        )
+    else:
+        logger.warning(f"Task nicht gefunden: {task_id}")
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "success": False,
+                "status": "error",
+                "message": f"Aufgabe mit ID {task_id} nicht gefunden"
+            }
+        )
+
+async def process_pdf_in_background(task_id: str, pdf_path: str, config: Config, metadata: Dict):
+    """
+    Verarbeitet das PDF im Hintergrund und aktualisiert den Task-Status.
+    """
+    try:
+        logger.info(f"Starte Hintergrundverarbeitung für Task {task_id}: {pdf_path}")
+        
+        # Verarbeite die PDF-Datei
+        result = await process_pdf(pdf_path, config, metadata)
+        
+        # Aktualisiere den Status auf abgeschlossen
+        processing_tasks[task_id] = {
+            "status": "completed",
+            "message": "Verarbeitung abgeschlossen",
+            "questions": result.get("questions", []),
+            "data": result.get("data", {})
+        }
+        
+        logger.info(f"Hintergrundverarbeitung für Task {task_id} abgeschlossen")
+        
+    except Exception as e:
+        logger.error(f"Fehler bei der Hintergrundverarbeitung von Task {task_id}: {str(e)}")
+        
+        # Aktualisiere den Status auf Fehler
+        processing_tasks[task_id] = {
+            "status": "error",
+            "message": f"Fehler bei der Verarbeitung: {str(e)}",
+            "data": {
+                "error_details": str(e)
+            }
+        }
+        
+        # Eventuelle Aufräumarbeiten durchführen
 
 async def cleanup_temp_file(file_path: str, delay_seconds: int = 0):
     """Löscht temporäre Dateien mit optionaler Verzögerung"""
