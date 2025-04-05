@@ -637,6 +637,9 @@ async def upload_pdf(
     global current_pdf_filename
     current_pdf_filename = file.filename  # Speichere den Originalnamen
     
+    # Logging für User-ID
+    logger.info(f"Empfangene User-ID im Upload-Endpunkt: '{userId}'")
+    
     # Validiere Metadaten
     if not examName:
         return JSONResponse(
@@ -709,6 +712,9 @@ async def upload_pdf(
             "user_id": userId, # Pass userId to metadata
             "visibility": visibility # Pass visibility to metadata
         }
+        
+        # Logging für Metadaten
+        logger.info(f"Metadaten mit User-ID für PDF-Verarbeitung: user_id='{metadata.get('user_id')}', visibility='{metadata.get('visibility')}'")
         
         # Erstelle eine Task-ID für das Tracking
         task_id = str(uuid.uuid4())
@@ -810,6 +816,7 @@ async def process_pdf_in_background(task_id: str, pdf_path: str, config: Config,
     try:
         global processing_tasks # Declare processing_tasks as global
         logger.info(f"Starte Hintergrundverarbeitung für Task {task_id}: {pdf_path}")
+        logger.info(f"Metadaten in process_pdf_in_background: user_id='{metadata.get('user_id')}', visibility='{metadata.get('visibility')}'")
         
         # 1. Verarbeite die PDF-Datei (Extraktion, Bild-Upload)
         processing_result = await process_pdf(pdf_path, config, metadata)
@@ -1468,6 +1475,7 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
     failed = 0
     
     logger.info(f"Füge {len(questions)} Fragen in Supabase ein, Datei: {current_pdf_filename}")
+    logger.info(f"Parameter für DB-Insert: user_id='{user_id}', visibility='{visibility}'")
     
     # Verwende den globalen Dateinamen oder einen Fallback
     pdf_filename = current_pdf_filename
@@ -1505,6 +1513,11 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
             "visibility": str(visibility) # Add visibility
         }
         bulk_data.append(data)
+        
+    # Beispiel-Log für einen Datensatz (Stichprobe)
+    if bulk_data:
+        sample_data = bulk_data[0]
+        logger.info(f"Stichprobe eines Datensatzes für Upsert: user_id='{sample_data.get('user_id')}', visibility='{sample_data.get('visibility')}'")
     
     # Falls keine Daten vorhanden sind, beende frühzeitig
     if not bulk_data:
@@ -1521,6 +1534,7 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
             logger.info(f"Verarbeite Batch {i//batch_size + 1}/{(len(bulk_data) + batch_size - 1)//batch_size}: {len(batch)} Fragen")
             
             try:
+                logger.info(f"Sende Batch {i//batch_size + 1} an Supabase. Erster Eintrag: user_id='{batch[0].get('user_id')}', visibility='{batch[0].get('visibility')}'")
                 response = supabase.table('questions').upsert(batch).execute()
                 
                 # Prüfe auf Fehler im Response
@@ -1531,6 +1545,7 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
                     # Zähle erfolgreiche Datensätze
                     if hasattr(response, 'data') and response.data:
                         successful += len(response.data)
+                        logger.info(f"Erfolgreich hochgeladen: {len(response.data)} Datensätze. Beispiel user_id im Response: {response.data[0].get('user_id') if response.data else 'Keine Daten'}")
                     else:
                         successful += len(batch)  # Annahme: alle erfolgreich, wenn kein expliziter Fehler
                         
