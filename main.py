@@ -8,6 +8,7 @@ import boto3
 import os
 import asyncio
 import concurrent.futures
+import openai
 from fastapi import FastAPI, UploadFile, File, HTTPException, status, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -32,6 +33,9 @@ app = FastAPI(title="Exam PDF Processor", version="1.0.0")
 
 # Lade .env Datei beim Start
 load_dotenv()
+
+# OpenAI Client initialisieren
+openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # --- Globaler In-Memory Speicher für Task-Status (NUR FÜR workers=1 geeignet!) ---
 processing_tasks = {}
@@ -104,6 +108,141 @@ def validate_pdf(file: UploadFile) -> bool:
     # Hier könnten weitere Validierungen hinzugefügt werden
     return True
 
+async def analyze_subject_with_openai(questions, batch_size=5):
+    """
+    Analysiert Fragen mit OpenAI, um das Fach zu bestimmen und für Konsistenz zu sorgen.
+    Vorhandene Fachangaben werden ins Kommentarfeld übertragen.
+    
+    Args:
+        questions: Liste von Frage-Objekten
+        batch_size: Anzahl der Fragen pro Batch für Effizienz
+        
+    Returns:
+        Liste der Fragen mit aktualisiertem "subject"-Feld und ggf. aktualisiertem "comment"-Feld
+    """
+    if not questions:
+        logger.warning("Keine Fragen zum Analysieren vorhanden")
+        return questions
+        
+    logger.info(f"Starte Fachanalyse mit OpenAI für {len(questions)} Fragen")
+    
+    # Prüfe, ob OpenAI API Key vorhanden ist
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.error("Kein OpenAI API Key gefunden. Fachanalyse wird übersprungen.")
+        return questions
+    
+    # Bereite die Analyse in Batches vor für bessere Performance
+    batches = [questions[i:i+batch_size] for i in range(0, len(questions), batch_size)]
+    
+    for batch_idx, batch in enumerate(batches):
+        logger.info(f"Verarbeite Batch {batch_idx+1}/{len(batches)} mit {len(batch)} Fragen")
+        
+        try:
+            # Erstelle den Prompt für die aktuelle Batch
+            prompt = "Analysiere folgende Prüfungsfragen und bestimme das Fach (z.B. Biologie, Chemie, Physik, Mathematik, etc.).\n\n"
+            
+            for q_idx, q in enumerate(batch):
+                # Extrahiere die relevanten Informationen für die Analyse
+                question_text = q.get("question", "")
+                options = []
+                
+                # Füge Optionen hinzu, falls vorhanden
+                if isinstance(q.get("options"), dict):
+                    options_dict = q.get("options")
+                    for key in ["A", "B", "C", "D", "E"]:
+                        if options_dict.get(key):
+                            options.append(f"{key}) {options_dict.get(key)}")
+                else:
+                    # Fallback für älteres Format
+                    for key in ["option_a", "option_b", "option_c", "option_d", "option_e"]:
+                        if q.get(key):
+                            letter = key[-1].upper()
+                            options.append(f"{letter}) {q.get(key)}")
+                
+                prompt += f"Frage {q_idx+1}:\n{question_text}\n"
+                if options:
+                    prompt += "Antwortmöglichkeiten:\n" + "\n".join(options) + "\n\n"
+            
+            # Füge die Anweisung für das erwartete Format hinzu
+            prompt += "\nAntworte mit einem JSON-Array im Format: [{\"index\": 0, \"subject\": \"Fachname\"}, ...]\n"
+            prompt += "Bestimme das Fach so genau wie möglich, aber achte auf Konsistenz zwischen ähnlichen Fragen."
+            
+            # API-Aufruf an OpenAI
+            logger.info(f"Sende Batch {batch_idx+1} an OpenAI für Fachanalyse")
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Du bist ein Experte für akademische Fächer und analysierst Prüfungsfragen."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,  # Niedrige Temperatur für konsistentere Antworten
+                max_tokens=2000
+            )
+            
+            # Verarbeite die Antwort
+            result_text = response.choices[0].message.content.strip()
+            logger.info(f"OpenAI Antwort für Batch {batch_idx+1} erhalten: {result_text[:100]}...")
+            
+            # Versuche das JSON zu parsen
+            import json
+            try:
+                # Extrahiere JSON aus der Antwort (falls es in Markdown-Codeblöcken ist)
+                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', result_text)
+                if json_match:
+                    result_text = json_match.group(1).strip()
+                else:
+                    # Versuche JSON direkt zu extrahieren
+                    json_match = re.search(r'\[\s*{.*}\s*\]', result_text, re.DOTALL)
+                    if json_match:
+                        result_text = json_match.group(0)
+                
+                subject_data = json.loads(result_text)
+                
+                # Verwende das erste Fach als Default für den ganzen Batch (für Konsistenz)
+                default_subject = None
+                if subject_data and isinstance(subject_data, list) and len(subject_data) > 0:
+                    if subject_data[0].get("subject"):
+                        default_subject = subject_data[0].get("subject")
+                
+                if not default_subject:
+                    logger.warning(f"Kein Fach in der OpenAI-Antwort für Batch {batch_idx+1} gefunden")
+                    continue
+                
+                logger.info(f"Ermitteltes Fach für Batch {batch_idx+1}: {default_subject}")
+                
+                # Aktualisiere alle Fragen in diesem Batch
+                for q_idx, q in enumerate(batch):
+                    # Wenn bereits ein Fach vorhanden ist, verschiebe es ins Kommentarfeld
+                    existing_subject = None
+                    
+                    if q.get("subject") and q.get("subject").strip():
+                        existing_subject = q.get("subject").strip()
+                        # Verschiebe vorhandenes Fach in Kommentarfeld
+                        if not q.get("comment"):
+                            q["comment"] = f"Ursprüngliches Fach: {existing_subject}"
+                        else:
+                            q["comment"] = f"Ursprüngliches Fach: {existing_subject}\n\n{q.get('comment')}"
+                    
+                    # Setze das neue, konsistente Fach
+                    q["subject"] = default_subject
+                    
+                    # Log für die Änderung
+                    if existing_subject:
+                        logger.info(f"Fach für Frage {q_idx+1} aktualisiert: '{existing_subject}' -> '{default_subject}' (in Kommentar verschoben)")
+                    else:
+                        logger.info(f"Fach für Frage {q_idx+1} gesetzt: '{default_subject}'")
+                
+            except (json.JSONDecodeError, ValueError, AttributeError) as e:
+                logger.error(f"Fehler beim Parsen der OpenAI-Antwort für Batch {batch_idx+1}: {str(e)}")
+                logger.error(f"Antworttext: {result_text}")
+        
+        except Exception as e:
+            logger.error(f"Fehler bei der OpenAI-Analyse für Batch {batch_idx+1}: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    logger.info(f"Fachanalyse für {len(questions)} Fragen abgeschlossen")
+    return questions
+
 async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
     """Verarbeitet das PDF mit verbesserter Fehlerbehandlung und Performance-Optimierungen"""
     try:
@@ -114,7 +253,10 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
         exam_name = metadata.get("exam_name") or extracted_exam_name
         exam_year = metadata.get("exam_year") or extracted_exam_year
         exam_semester = metadata.get("exam_semester") or extracted_exam_semester
-        default_subject = metadata.get("subject", "")
+        
+        # Subject wird nicht aus den Metadaten übernommen, sondern nur aus dem PDF extrahiert
+        # oder bleibt leer, wenn nicht im PDF gefunden
+        default_subject = ""
         
         logger.info(f"Verarbeite PDF: {exam_name} {exam_year} {exam_semester}")
 
@@ -144,6 +286,9 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                 parse_question_details(q)
                 
         logger.info(f"{len(questions)} Fragen extrahiert und verarbeitet")
+        
+        # NEU: Analyse der Fächer mit OpenAI für einheitliche Bezeichnungen
+        questions = await analyze_subject_with_openai(questions)
 
         # Verarbeite Bilder mit verbesserter Fehlerbehandlung und Performance
         images = []
@@ -629,7 +774,7 @@ async def upload_pdf(
     examName: str = Form(""),
     examYear: str = Form(""),
     examSemester: str = Form(""),
-    subject: str = Form(""),
+    subject: str = Form(""),  # Parameter bleibt zum Empfang, wird aber ignoriert
     userId: str = Form(""), # Receive userId
     visibility: str = Form("private"), # Receive visibility, default to private
     background_tasks: BackgroundTasks = None
@@ -708,9 +853,9 @@ async def upload_pdf(
             "exam_name": examName,
             "exam_year": examYear,
             "exam_semester": examSemester,
-            "subject": subject,
-            "user_id": userId, # Pass userId to metadata
-            "visibility": visibility # Pass visibility to metadata
+            # "subject" wird absichtlich nicht in die Metadaten aufgenommen, da es ignoriert werden soll
+            "user_id": userId,
+            "visibility": visibility
         }
         
         # Logging für Metadaten
