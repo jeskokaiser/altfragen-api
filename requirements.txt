@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pdfplumber
+pymupdf
+psycopg2-binary
+boto3
+python-multipart
+supabase
+python-dotenv
