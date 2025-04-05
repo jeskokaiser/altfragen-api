@@ -8,13 +8,13 @@ import boto3
 import os
 import asyncio
 import concurrent.futures
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, status, Body, Form
 from fastapi.responses import JSONResponse
 import uvicorn
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import tempfile
 from urllib.parse import urlparse
 from datetime import datetime
@@ -100,11 +100,18 @@ def validate_pdf(file: UploadFile) -> bool:
     # Hier könnten weitere Validierungen hinzugefügt werden
     return True
 
-async def process_pdf(pdf_path: str, config: Config) -> Dict:
+async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
     """Verarbeitet das PDF mit verbesserter Fehlerbehandlung und Performance-Optimierungen"""
     try:
-        # Extrahiere Header aus Dateinamen
-        exam_name, exam_year, exam_semester = extract_exam_header(pdf_path)
+        # Extrahiere Header aus Dateinamen (als Fallback, wenn keine Metadaten angegeben)
+        extracted_exam_name, extracted_exam_year, extracted_exam_semester = extract_exam_header(pdf_path)
+        
+        # Verwende übergebene Metadaten mit Fallback auf extrahierte Werte
+        exam_name = metadata.get("exam_name") or extracted_exam_name
+        exam_year = metadata.get("exam_year") or extracted_exam_year
+        exam_semester = metadata.get("exam_semester") or extracted_exam_semester
+        default_subject = metadata.get("subject", "")
+        
         logger.info(f"Verarbeite PDF: {exam_name} {exam_year} {exam_semester}")
 
         # Extrahiere und verarbeite Fragen
@@ -113,6 +120,7 @@ async def process_pdf(pdf_path: str, config: Config) -> Dict:
             logger.warning("Keine Fragen im PDF gefunden")
             return {
                 "status": "warning",
+                "success": False,
                 "message": "Keine Fragen im PDF gefunden",
                 "data": {
                     "exam_name": exam_name,
@@ -343,33 +351,53 @@ async def process_pdf(pdf_path: str, config: Config) -> Dict:
                     except Exception as e:
                         logger.error(f"Fehler beim synchronen Upload von {task['filename']}: {str(e)}")
 
-        # Speichere Fragen in Supabase
-        successful_questions, failed_questions = 0, 0
-        try:
-            successful_questions, failed_questions = insert_questions_into_db(
-                questions, exam_name, exam_year, exam_semester, config
-            )
-        except Exception as e:
-            logger.error(f"Fehler beim Einfügen in die Datenbank: {str(e)}")
+        # Bereite Fragedaten für das Frontend auf (anstatt sie direkt in die Datenbank einzufügen)
+        formatted_questions = []
+        
+        for q in questions:
+            # Verwende extrahierte Werte mit Fallback auf übergebene Metadaten
+            subject = q.get("subject") or default_subject
+            
+            formatted_question = {
+                "id": q.get("id", str(uuid.uuid4())),
+                "question": q.get("question", ""),
+                "options": {
+                    "A": q.get("option_a", ""),
+                    "B": q.get("option_b", ""),
+                    "C": q.get("option_c", ""),
+                    "D": q.get("option_d", ""),
+                    "E": q.get("option_e", "")
+                },
+                "correctAnswer": q.get("correct_answer", ""),
+                "subject": subject,
+                "comment": q.get("comment", ""),
+                "difficulty": 3,  # Standardwert
+                "semester": exam_semester,
+                "year": exam_year,
+                "image_key": q.get("image_key", "")
+            }
+            formatted_questions.append(formatted_question)
 
         return {
             "status": "success",
+            "success": True,  # Für Frontend-Kompatibilität
             "data": {
                 "exam_name": exam_name,
-                "questions_processed": successful_questions,
-                "questions_failed": failed_questions,
                 "images_uploaded": successful_uploads,
                 "total_questions": len(questions),
                 "total_images": len(images),
-            }
+            },
+            "questions": formatted_questions  # Neue Struktur für das Frontend
         }
 
     except Exception as e:
         logger.error(f"Fehler bei der PDF-Verarbeitung: {str(e)}")
         return {
             "status": "error",
+            "success": False,  # Für Frontend-Kompatibilität
             "message": str(e),
-            "data": {}
+            "data": {},
+            "questions": []
         }
 
 async def upload_image_async(s3_client, image_bytes, filename, bucket_name, content_type):
@@ -593,10 +621,50 @@ async def detailed_health_check():
     response_description="Verarbeitungsstatus und Details")
 async def upload_pdf(
     file: UploadFile = File(...),
+    examName: str = Form(""),
+    examYear: str = Form(""),
+    examSemester: str = Form(""),
+    subject: str = Form(""),
     background_tasks: BackgroundTasks = None
 ) -> JSONResponse:
     global current_pdf_filename
     current_pdf_filename = file.filename  # Speichere den Originalnamen
+    
+    # Validiere Metadaten
+    if not examName:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "status": "error",
+                "success": False,
+                "message": "Prüfungsname ist erforderlich",
+                "data": {}
+            }
+        )
+        
+    # Validiere examYear, falls angegeben
+    if examYear and not (examYear.isdigit() and len(examYear) == 4):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "status": "error",
+                "success": False,
+                "message": "Prüfungsjahr muss ein vierstelliges Jahr sein",
+                "data": {}
+            }
+        )
+        
+    # Validiere examSemester, falls angegeben
+    if examSemester and examSemester not in ["WS", "SS"]:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "status": "error",
+                "success": False,
+                "message": "Semester muss entweder 'WS' oder 'SS' sein",
+                "data": {}
+            }
+        )
     
     try:
         if not validate_pdf(file):
@@ -624,8 +692,20 @@ async def upload_pdf(
 
         config = Config()
         
+        # Erstelle ein Metadaten-Wörterbuch für die PDF-Verarbeitung
+        metadata = {
+            "exam_name": examName,
+            "exam_year": examYear,
+            "exam_semester": examSemester,
+            "subject": subject
+        }
+        
+        # Im asynchronen Modus starten wir die Verarbeitung im Hintergrund
+        # und geben sofort eine Antwort zurück
         if background_tasks:
-            background_tasks.add_task(process_pdf, temp_file_path, config)
+            # Bei Hintergrundverarbeitung kann keine Vorschau zurückgegeben werden
+            # Dieser Pfad sollte nur für die Legacy-API verwendet werden
+            background_tasks.add_task(process_pdf, temp_file_path, config, metadata)
             # Verzögere das Löschen der Datei - Task-ID hinzufügen
             task_id = str(uuid.uuid4())
             logger.info(f"Hintergrundaufgabe gestartet: {task_id}")
@@ -642,8 +722,10 @@ async def upload_pdf(
                 }
             )
         else:
+            # Im synchronen Modus verarbeiten wir die PDF und geben die Vorschaudaten zurück
             try:
-                result = await process_pdf(temp_file_path, config)
+                # Verarbeite PDF synchron und gib Daten direkt zurück (für Vorschau)
+                result = await process_pdf(temp_file_path, config, metadata)
                 return JSONResponse(
                     status_code=status.HTTP_200_OK,
                     content=result
@@ -1446,6 +1528,105 @@ def analyze_pdf_structure(pdf_path):
                 logger.info(f"{name}: {len(matches)} Treffer - Beispiele: {matches[:3]}")
     
     return {"pages": len(doc), "analyzed_samples": sample_pages}
+
+@app.post("/save-questions", 
+    summary="Speichert bearbeitete Fragen in der Datenbank",
+    response_description="Speicherungsstatus und Details")
+async def save_questions(
+    questions: List[Dict] = Body(...),
+    exam_name: str = Body(""),
+    exam_year: str = Body(""),
+    exam_semester: str = Body("")
+) -> JSONResponse:
+    try:
+        logger.info(f"Speichere {len(questions)} bearbeitete Fragen in Supabase")
+        
+        # Validiere Metadaten
+        if not exam_name:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "status": "error",
+                    "success": False,
+                    "message": "Prüfungsname ist erforderlich",
+                    "data": {}
+                }
+            )
+        
+        # Formatiere die Fragen in das Format für die Datenbank
+        db_questions = []
+        for q in questions:
+            options = q.get("options", {})
+            
+            # Verwende Frageninterne Werte oder Fallback auf globale Metadaten
+            question_year = q.get("year", exam_year)
+            question_semester = q.get("semester", exam_semester)
+            question_subject = q.get("subject", subject)
+            
+            db_question = {
+                "id": q.get("id", str(uuid.uuid4())),
+                "exam_name": exam_name,
+                "exam_year": question_year,
+                "exam_semester": question_semester,
+                "question": q.get("question", ""),
+                "option_a": options.get("A", ""),
+                "option_b": options.get("B", ""),
+                "option_c": options.get("C", ""),
+                "option_d": options.get("D", ""),
+                "option_e": options.get("E", ""),
+                "subject": question_subject,
+                "correct_answer": q.get("correctAnswer", ""),
+                "comment": q.get("comment", ""),
+                "image_key": q.get("image_key", ""),
+                "filename": current_pdf_filename,
+            }
+            db_questions.append(db_question)
+        
+        # Konfiguration initialisieren
+        config = Config()
+        
+        # Speichere Fragen in Supabase mit der vorhandenen Funktion
+        try:
+            successful_questions, failed_questions = insert_questions_into_db(
+                db_questions, exam_name, exam_year, exam_semester, config
+            )
+            
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "status": "success",
+                    "success": True,
+                    "message": f"{successful_questions} Fragen erfolgreich gespeichert, {failed_questions} fehlgeschlagen",
+                    "data": {
+                        "questions_processed": successful_questions,
+                        "questions_failed": failed_questions,
+                        "total_questions": len(questions)
+                    }
+                }
+            )
+        except Exception as e:
+            logger.error(f"Fehler beim Einfügen in die Datenbank: {str(e)}")
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={
+                    "status": "error",
+                    "success": False,
+                    "message": f"Fehler beim Speichern in der Datenbank: {str(e)}",
+                    "data": {}
+                }
+            )
+    
+    except Exception as e:
+        logger.error(f"Fehler bei der Verarbeitung der bearbeiteten Fragen: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "success": False,
+                "message": str(e),
+                "data": {}
+            }
+        )
 
 if __name__ == "__main__":
     uvicorn.run(
