@@ -1370,9 +1370,6 @@ def extract_images_with_coords(doc: fitz.Document): # Akzeptiert doc statt pdf_p
     # Zusammenfassung
     logger.info(f"Bildextraktion abgeschlossen: {len(images)} einzigartige Bilder aus {len(doc)} Seiten")
     
-    # Gib Speicher frei
-    doc.close()
-    
     # Prüfe Bildqualität und Größe
     if images:
         logger.info(f"Beispiel-Bildgröße: {len(images[0]['image_bytes'])} Bytes, Format: {images[0]['image_ext']}")
