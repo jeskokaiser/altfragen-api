@@ -1169,7 +1169,7 @@ def extract_questions_with_coords(pdf_path):
                  logger.info(f"Block {block_idx+1}: Alternative Frage (?) gefunden: {question_data['question'][:60]}...")
                  # Extrahiere Optionen/Meta auch hier (vereinfacht)
                  for letter in "ABCDE":
-                     option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*(?:[A-E]\\)|Fach:|Antwort:|Kommentar:)|$)', block_text, re.DOTALL)
+                     option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*[A-E]\\)|\\s*Fach:|\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL)
                      if option_match: question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
                  fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
                  if fach_match: question_data["subject"] = fach_match.group(1).strip()
@@ -1184,7 +1184,7 @@ def extract_questions_with_coords(pdf_path):
                      logger.info(f"Block {block_idx+1}: Fallback-Frage (erste Zeile) verwendet: {question_data['question'][:60]}...")
                      # Extrahiere Optionen/Meta auch hier (vereinfacht)
                      for letter in "ABCDE":
-                        option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*(?:[A-E]\\)|Fach:|Antwort:|Kommentar:)|$)', block_text, re.DOTALL)
+                        option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*[A-E]\\)|\\s*Fach:|\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL)
                         if option_match: question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
                      fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
                      if fach_match: question_data["subject"] = fach_match.group(1).strip()
