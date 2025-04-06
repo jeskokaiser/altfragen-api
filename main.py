@@ -8,7 +8,6 @@ import boto3
 import os
 import asyncio
 import concurrent.futures
-import openai
 from fastapi import FastAPI, UploadFile, File, HTTPException, status, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -33,9 +32,6 @@ app = FastAPI(title="Exam PDF Processor", version="1.0.0")
 
 # Lade .env Datei beim Start
 load_dotenv()
-
-# OpenAI Client initialisieren
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # --- Globaler In-Memory Speicher für Task-Status (NUR FÜR workers=1 geeignet!) ---
 processing_tasks = {}
@@ -108,141 +104,6 @@ def validate_pdf(file: UploadFile) -> bool:
     # Hier könnten weitere Validierungen hinzugefügt werden
     return True
 
-async def analyze_subject_with_openai(questions, batch_size=5):
-    """
-    Analysiert Fragen mit OpenAI, um das Fach zu bestimmen und für Konsistenz zu sorgen.
-    Vorhandene Fachangaben werden ins Kommentarfeld übertragen.
-    
-    Args:
-        questions: Liste von Frage-Objekten
-        batch_size: Anzahl der Fragen pro Batch für Effizienz
-        
-    Returns:
-        Liste der Fragen mit aktualisiertem "subject"-Feld und ggf. aktualisiertem "comment"-Feld
-    """
-    if not questions:
-        logger.warning("Keine Fragen zum Analysieren vorhanden")
-        return questions
-        
-    logger.info(f"Starte Fachanalyse mit OpenAI für {len(questions)} Fragen")
-    
-    # Prüfe, ob OpenAI API Key vorhanden ist
-    if not os.getenv("OPENAI_API_KEY"):
-        logger.error("Kein OpenAI API Key gefunden. Fachanalyse wird übersprungen.")
-        return questions
-    
-    # Bereite die Analyse in Batches vor für bessere Performance
-    batches = [questions[i:i+batch_size] for i in range(0, len(questions), batch_size)]
-    
-    for batch_idx, batch in enumerate(batches):
-        logger.info(f"Verarbeite Batch {batch_idx+1}/{len(batches)} mit {len(batch)} Fragen")
-        
-        try:
-            # Erstelle den Prompt für die aktuelle Batch
-            prompt = "Analysiere folgende Prüfungsfragen und bestimme das Fach (z.B. Biologie, Chemie, Physik, Mathematik, etc.).\n\n"
-            
-            for q_idx, q in enumerate(batch):
-                # Extrahiere die relevanten Informationen für die Analyse
-                question_text = q.get("question", "")
-                options = []
-                
-                # Füge Optionen hinzu, falls vorhanden
-                if isinstance(q.get("options"), dict):
-                    options_dict = q.get("options")
-                    for key in ["A", "B", "C", "D", "E"]:
-                        if options_dict.get(key):
-                            options.append(f"{key}) {options_dict.get(key)}")
-                else:
-                    # Fallback für älteres Format
-                    for key in ["option_a", "option_b", "option_c", "option_d", "option_e"]:
-                        if q.get(key):
-                            letter = key[-1].upper()
-                            options.append(f"{letter}) {q.get(key)}")
-                
-                prompt += f"Frage {q_idx+1}:\n{question_text}\n"
-                if options:
-                    prompt += "Antwortmöglichkeiten:\n" + "\n".join(options) + "\n\n"
-            
-            # Füge die Anweisung für das erwartete Format hinzu
-            prompt += "\nAntworte mit einem JSON-Array im Format: [{\"index\": 0, \"subject\": \"Fachname\"}, ...]\n"
-            prompt += "Bestimme das Fach so genau wie möglich, aber achte auf Konsistenz zwischen ähnlichen Fragen."
-            
-            # API-Aufruf an OpenAI
-            logger.info(f"Sende Batch {batch_idx+1} an OpenAI für Fachanalyse")
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Du bist ein Experte für akademische Fächer und analysierst Prüfungsfragen."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,  # Niedrige Temperatur für konsistentere Antworten
-                max_tokens=2000
-            )
-            
-            # Verarbeite die Antwort
-            result_text = response.choices[0].message.content.strip()
-            logger.info(f"OpenAI Antwort für Batch {batch_idx+1} erhalten: {result_text[:100]}...")
-            
-            # Versuche das JSON zu parsen
-            import json
-            try:
-                # Extrahiere JSON aus der Antwort (falls es in Markdown-Codeblöcken ist)
-                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', result_text)
-                if json_match:
-                    result_text = json_match.group(1).strip()
-                else:
-                    # Versuche JSON direkt zu extrahieren
-                    json_match = re.search(r'\[\s*{.*}\s*\]', result_text, re.DOTALL)
-                    if json_match:
-                        result_text = json_match.group(0)
-                
-                subject_data = json.loads(result_text)
-                
-                # Verwende das erste Fach als Default für den ganzen Batch (für Konsistenz)
-                default_subject = None
-                if subject_data and isinstance(subject_data, list) and len(subject_data) > 0:
-                    if subject_data[0].get("subject"):
-                        default_subject = subject_data[0].get("subject")
-                
-                if not default_subject:
-                    logger.warning(f"Kein Fach in der OpenAI-Antwort für Batch {batch_idx+1} gefunden")
-                    continue
-                
-                logger.info(f"Ermitteltes Fach für Batch {batch_idx+1}: {default_subject}")
-                
-                # Aktualisiere alle Fragen in diesem Batch
-                for q_idx, q in enumerate(batch):
-                    # Wenn bereits ein Fach vorhanden ist, verschiebe es ins Kommentarfeld
-                    existing_subject = None
-                    
-                    if q.get("subject") and q.get("subject").strip():
-                        existing_subject = q.get("subject").strip()
-                        # Verschiebe vorhandenes Fach in Kommentarfeld
-                        if not q.get("comment"):
-                            q["comment"] = f"Ursprüngliches Fach: {existing_subject}"
-                        else:
-                            q["comment"] = f"Ursprüngliches Fach: {existing_subject}\n\n{q.get('comment')}"
-                    
-                    # Setze das neue, konsistente Fach
-                    q["subject"] = default_subject
-                    
-                    # Log für die Änderung
-                    if existing_subject:
-                        logger.info(f"Fach für Frage {q_idx+1} aktualisiert: '{existing_subject}' -> '{default_subject}' (in Kommentar verschoben)")
-                    else:
-                        logger.info(f"Fach für Frage {q_idx+1} gesetzt: '{default_subject}'")
-                
-            except (json.JSONDecodeError, ValueError, AttributeError) as e:
-                logger.error(f"Fehler beim Parsen der OpenAI-Antwort für Batch {batch_idx+1}: {str(e)}")
-                logger.error(f"Antworttext: {result_text}")
-        
-        except Exception as e:
-            logger.error(f"Fehler bei der OpenAI-Analyse für Batch {batch_idx+1}: {str(e)}")
-            logger.error(traceback.format_exc())
-    
-    logger.info(f"Fachanalyse für {len(questions)} Fragen abgeschlossen")
-    return questions
-
 async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
     """Verarbeitet das PDF mit verbesserter Fehlerbehandlung und Performance-Optimierungen"""
     try:
@@ -253,10 +114,7 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
         exam_name = metadata.get("exam_name") or extracted_exam_name
         exam_year = metadata.get("exam_year") or extracted_exam_year
         exam_semester = metadata.get("exam_semester") or extracted_exam_semester
-        
-        # Subject wird nicht aus den Metadaten übernommen, sondern nur aus dem PDF extrahiert
-        # oder bleibt leer, wenn nicht im PDF gefunden
-        default_subject = ""
+        default_subject = metadata.get("subject", "")
         
         logger.info(f"Verarbeite PDF: {exam_name} {exam_year} {exam_semester}")
 
@@ -286,9 +144,6 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                 parse_question_details(q)
                 
         logger.info(f"{len(questions)} Fragen extrahiert und verarbeitet")
-        
-        # NEU: Analyse der Fächer mit OpenAI für einheitliche Bezeichnungen
-        questions = await analyze_subject_with_openai(questions)
 
         # Verarbeite Bilder mit verbesserter Fehlerbehandlung und Performance
         images = []
@@ -405,10 +260,10 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
             logger.error(f"Fehler bei S3-Client-Initialisierung: {str(s3_error)}")
             s3_client = None
         
-        # Bereite Bildupload-Tasks vor (für parallele Verarbeitung)
+        # Bereite Bildupload-Tasks für Supabase Storage vor
         upload_tasks = []
         for img_idx, img in enumerate(images):
-            if img.get("question_id") and s3_client:
+            if img.get("question_id"):
                 # Sichere Extraktion der Y-Koordinate
                 bbox = img.get("bbox", [0, 0, 0, 0])
                 img_y = 0
@@ -449,7 +304,7 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                 for task in batch:
                     # Asynchrone Funktion für Upload
                     upload_future = asyncio.ensure_future(upload_image_async(
-                        s3_client, 
+                        config, 
                         task["image_bytes"], 
                         task["filename"], 
                         bucket_name, 
@@ -477,19 +332,23 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
             logger.warning("Verwende den synchronen Upload-Fallback")
             
             # Fallback: Verwende synchronen Upload, wenn der asynchrone fehlschlägt
-            if successful_uploads == 0 and len(upload_tasks) > 0 and s3_client:
+            if successful_uploads == 0 and len(upload_tasks) > 0:
                 logger.info("Starte synchrone Uploads als Fallback")
                 
                 for task in upload_tasks:
                     try:
-                        # Synchroner Upload als Fallback
-                        s3_client.put_object(
-                            Bucket=bucket_name,
-                            Key=task["filename"],
-                            Body=task["image_bytes"],
-                            ContentType=task["content_type"]
+                        # Synchroner Upload als Fallback mit Supabase Storage
+                        options = {
+                            'content-type': task["content_type"],
+                            'upsert': 'true'
+                        }
+                        response = config.supabase.storage.from_(bucket_name).upload(
+                            task["filename"], 
+                            task["image_bytes"], 
+                            options
                         )
-                        logger.info(f"Synchroner Upload erfolgreich: {task['filename']}")
+                        
+                        logger.info(f"Synchroner Supabase-Upload erfolgreich: {task['filename']}")
                         successful_uploads += 1
                         
                         # Aktualisiere die zugehörige Frage mit dem Bildschlüssel
@@ -499,7 +358,7 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                                 logger.info(f"Bild {task['filename']} mit Frage {q.get('question_number', '?')} verknüpft (synchron)")
                                 break
                     except Exception as e:
-                        logger.error(f"Fehler beim synchronen Upload von {task['filename']}: {str(e)}")
+                        logger.error(f"Fehler beim synchronen Supabase-Upload von {task['filename']}: {str(e)}")
 
         # Bereite Fragedaten für das Frontend auf (anstatt sie direkt in die Datenbank einzufügen)
         formatted_questions = []
@@ -607,6 +466,71 @@ async def upload_image_async(s3_client, image_bytes, filename, bucket_name, cont
             
     except Exception as e:
         logger.error(f"Unbehandelter Fehler beim asynchronen Upload von {filename}: {str(e)}")
+        return False
+
+async def upload_image_async(config, image_bytes, filename, bucket_name, content_type):
+    """
+    Asynchrone Funktion zum Hochladen eines Bildes nach Supabase Storage mit Fehlerbehandlung
+    """
+    if not config or not config.supabase:
+        logger.error(f"Keine Supabase-Konfiguration für Upload vorhanden: {filename}")
+        return False
+        
+    if not image_bytes or len(image_bytes) < 100:
+        logger.error(f"Unzureichende Bilddaten für {filename}: {len(image_bytes) if image_bytes else 0} Bytes")
+        return False
+        
+    try:
+        logger.info(f"Starte asynchronen Supabase-Upload: {filename} ({len(image_bytes)} Bytes)")
+        
+        # Führe den Supabase-Upload in einem ThreadPool aus, um das I/O nicht zu blockieren
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            # Verwende ein maximales Timeout für den Upload
+            upload_timeout = 30  # 30 Sekunden Timeout
+            
+            # Definiere die Upload-Funktion für den Thread
+            def do_upload():
+                try:
+                    # Verwende die Supabase Storage API
+                    options = {
+                        'content-type': content_type,
+                        'upsert': 'true'  # Überschreibe falls die Datei existiert
+                    }
+                    response = config.supabase.storage.from_(bucket_name).upload(filename, image_bytes, options)
+                    
+                    # Prüfe auf Fehler in der Antwort
+                    if hasattr(response, 'error') and response.error:
+                        logger.error(f"Supabase Storage Upload-Fehler: {response.error}")
+                        return False
+                    
+                    return True
+                except Exception as upload_error:
+                    logger.error(f"Fehler im Thread beim Supabase-Upload von {filename}: {str(upload_error)}")
+                    return False
+            
+            # Asynchrone Ausführung des Supabase-Uploads mit Timeout
+            try:
+                loop = asyncio.get_event_loop()
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(pool, do_upload),
+                    timeout=upload_timeout
+                )
+                
+                if result:
+                    logger.info(f"Asynchroner Supabase-Upload erfolgreich abgeschlossen: {filename}")
+                    return True
+                else:
+                    logger.error(f"Asynchroner Supabase-Upload fehlgeschlagen (Thread-Fehler): {filename}")
+                    return False
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout beim Supabase-Upload von {filename} nach {upload_timeout} Sekunden")
+                return False
+            except Exception as exec_error:
+                logger.error(f"Fehler bei ThreadPool-Ausführung für Supabase-Upload von {filename}: {str(exec_error)}")
+                return False
+            
+    except Exception as e:
+        logger.error(f"Unbehandelter Fehler beim asynchronen Supabase-Upload von {filename}: {str(e)}")
         return False
 
 @app.on_event("startup")
@@ -774,16 +698,13 @@ async def upload_pdf(
     examName: str = Form(""),
     examYear: str = Form(""),
     examSemester: str = Form(""),
-    subject: str = Form(""),  # Parameter bleibt zum Empfang, wird aber ignoriert
+    subject: str = Form(""),
     userId: str = Form(""), # Receive userId
     visibility: str = Form("private"), # Receive visibility, default to private
     background_tasks: BackgroundTasks = None
 ) -> JSONResponse:
     global current_pdf_filename
     current_pdf_filename = file.filename  # Speichere den Originalnamen
-    
-    # Logging für User-ID
-    logger.info(f"Empfangene User-ID im Upload-Endpunkt: '{userId}'")
     
     # Validiere Metadaten
     if not examName:
@@ -853,13 +774,10 @@ async def upload_pdf(
             "exam_name": examName,
             "exam_year": examYear,
             "exam_semester": examSemester,
-            # "subject" wird absichtlich nicht in die Metadaten aufgenommen, da es ignoriert werden soll
-            "user_id": userId,
-            "visibility": visibility
+            "subject": subject,
+            "user_id": userId, # Pass userId to metadata
+            "visibility": visibility # Pass visibility to metadata
         }
-        
-        # Logging für Metadaten
-        logger.info(f"Metadaten mit User-ID für PDF-Verarbeitung: user_id='{metadata.get('user_id')}', visibility='{metadata.get('visibility')}'")
         
         # Erstelle eine Task-ID für das Tracking
         task_id = str(uuid.uuid4())
@@ -961,7 +879,6 @@ async def process_pdf_in_background(task_id: str, pdf_path: str, config: Config,
     try:
         global processing_tasks # Declare processing_tasks as global
         logger.info(f"Starte Hintergrundverarbeitung für Task {task_id}: {pdf_path}")
-        logger.info(f"Metadaten in process_pdf_in_background: user_id='{metadata.get('user_id')}', visibility='{metadata.get('visibility')}'")
         
         # 1. Verarbeite die PDF-Datei (Extraktion, Bild-Upload)
         processing_result = await process_pdf(pdf_path, config, metadata)
@@ -1620,7 +1537,6 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
     failed = 0
     
     logger.info(f"Füge {len(questions)} Fragen in Supabase ein, Datei: {current_pdf_filename}")
-    logger.info(f"Parameter für DB-Insert: user_id='{user_id}', visibility='{visibility}'")
     
     # Verwende den globalen Dateinamen oder einen Fallback
     pdf_filename = current_pdf_filename
@@ -1658,11 +1574,6 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
             "visibility": str(visibility) # Add visibility
         }
         bulk_data.append(data)
-        
-    # Beispiel-Log für einen Datensatz (Stichprobe)
-    if bulk_data:
-        sample_data = bulk_data[0]
-        logger.info(f"Stichprobe eines Datensatzes für Upsert: user_id='{sample_data.get('user_id')}', visibility='{sample_data.get('visibility')}'")
     
     # Falls keine Daten vorhanden sind, beende frühzeitig
     if not bulk_data:
@@ -1679,7 +1590,6 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
             logger.info(f"Verarbeite Batch {i//batch_size + 1}/{(len(bulk_data) + batch_size - 1)//batch_size}: {len(batch)} Fragen")
             
             try:
-                logger.info(f"Sende Batch {i//batch_size + 1} an Supabase. Erster Eintrag: user_id='{batch[0].get('user_id')}', visibility='{batch[0].get('visibility')}'")
                 response = supabase.table('questions').upsert(batch).execute()
                 
                 # Prüfe auf Fehler im Response
@@ -1690,7 +1600,6 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
                     # Zähle erfolgreiche Datensätze
                     if hasattr(response, 'data') and response.data:
                         successful += len(response.data)
-                        logger.info(f"Erfolgreich hochgeladen: {len(response.data)} Datensätze. Beispiel user_id im Response: {response.data[0].get('user_id') if response.data else 'Keine Daten'}")
                     else:
                         successful += len(batch)  # Annahme: alle erfolgreich, wenn kein expliziter Fehler
                         
@@ -1768,6 +1677,42 @@ def upload_image_to_s3(image_bytes, filename, bucket_name, s3_config):
         logger.error(f"Fehler beim Hochladen des Bildes {filename}: {str(e)}")
         return False
 
+def upload_image_to_supabase(image_bytes, filename, bucket_name, config):
+    """
+    Lädt ein Bild zuverlässig in Supabase Storage hoch
+    """
+    if not image_bytes:
+        logger.error(f"Keine Bilddaten zum Hochladen für {filename}")
+        return False
+    
+    try:
+        logger.info(f"Lade Bild {filename} ({len(image_bytes)} Bytes) in Supabase Storage Bucket {bucket_name} hoch")
+        
+        # Bestimme den Content-Type basierend auf der Dateiendung
+        file_extension = filename.split(".")[-1].lower()
+        content_type = f'image/{file_extension}'
+        
+        # Upload-Optionen
+        options = {
+            'content-type': content_type,
+            'upsert': 'true'  # Überschreibe falls die Datei existiert
+        }
+        
+        # Führe den Upload mit Supabase Storage durch
+        response = config.supabase.storage.from_(bucket_name).upload(filename, image_bytes, options)
+        
+        # Prüfe auf Fehler in der Antwort
+        if hasattr(response, 'error') and response.error:
+            logger.error(f"Supabase Storage Upload-Fehler: {response.error}")
+            return False
+            
+        logger.info(f"Bild {filename} erfolgreich in Supabase Storage hochgeladen")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Fehler beim Hochladen des Bildes nach Supabase Storage {filename}: {str(e)}")
+        return False
+
 def update_question_image_key(question_id, image_key, db_config):
     """
     Aktualisiert den image_key für eine Frage in der Datenbank.
@@ -1803,12 +1748,12 @@ def main(pdf_path):
         for img in images:
             if img.get("question_id"):
                 filename = f"{img['question_id']}_{img['page']}_{int(img['bbox'][1])}.{img['image_ext']}"
-                # MinIO Upload beibehalten
-                upload_image_to_s3(
+                # Supabase Storage Upload
+                upload_image_to_supabase(
                     img["image_bytes"], 
                     filename, 
                     bucket_name, 
-                    config.minio_config
+                    config
                 )
                 # Aktualisiere die zugehörige Frage
                 for q in questions:
