@@ -1008,135 +1008,305 @@ def extract_exam_header(pdf_path):
 
 def extract_questions_with_coords(pdf_path):
     """
-    Optimierte Extraktion von Fragen speziell für Altfragen-Format mit Unterstrichtrennlinien
+    Extrahiert Fragen und ordnet Bilder direkt innerhalb ihrer Textblöcke (durch '_{10,}' getrennt) zu.
     """
-    logger.info(f"Extrahiere Fragen aus PDF: {pdf_path}")
-    doc = fitz.open(pdf_path)
-    logger.info(f"PDF hat {len(doc)} Seiten")
+    logger.info(f"Extrahiere Fragen und zugehörige Bilder aus PDF: {pdf_path}")
     
+    try:
+        doc = fitz.open(pdf_path)
+        logger.info(f"PDF hat {len(doc)} Seiten")
+    except Exception as e:
+        logger.error(f"Konnte PDF nicht öffnen: {pdf_path} - Fehler: {e}")
+        return []
+
     # Füge den gesamten Text zusammen
     full_text = ""
-    for page in doc:
-        page_text = page.get_text()
-        full_text += page_text
-    
+    page_texts = [] # Speichere Seitentexte und deren Startindex im Gesamttext
+    current_index = 0
+    for page_idx, page in enumerate(doc):
+        try:
+            page_text = page.get_text("text", sort=False) # Behalte Reihenfolge bei
+            page_texts.append({"index": current_index, "text": page_text, "page_idx": page_idx})
+            full_text += page_text
+            current_index += len(page_text)
+        except Exception as e_page_text:
+             logger.error(f"Fehler beim Extrahieren von Text auf Seite {page_idx}: {e_page_text}")
+
     # Debug-Ausgabe eines Textausschnitts
-    logger.info(f"Textprobe (erste 300 Zeichen): {full_text[:300]}")
+    logger.info(f"Textprobe (erste 500 Zeichen): {full_text[:500]}")
     
     # Trenne Text in Fragen-Blöcke mit mindestens 10 Unterstrichen
-    question_blocks = re.split(r'_{10,}', full_text)
-    logger.info(f"Gefunden: {len(question_blocks)} durch Unterstriche getrennte Blöcke")
+    # Verwende finditer, um Start/Ende der Trenner zu bekommen
+    separators = list(re.finditer(r'_{10,}', full_text))
+    question_blocks_info = []
+    last_end = 0
+    for sep in separators:
+        start, end = sep.span()
+        block_text = full_text[last_end:start].strip()
+        if block_text:
+             question_blocks_info.append({"text": block_text, "start": last_end, "end": start})
+        last_end = end
+    # Letzten Block hinzufügen
+    final_block_text = full_text[last_end:].strip()
+    if final_block_text:
+         question_blocks_info.append({"text": final_block_text, "start": last_end, "end": len(full_text)})
+
+    logger.info(f"Gefunden: {len(question_blocks_info)} durch Unterstriche getrennte Textblöcke")
     
     questions = []
     
-    # Erste Variante: Suche nach "X. Frage:" Format
-    question_pattern = re.compile(r'(\d+)\.\s*Frage:?\s*(.*?)(?=(?:\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$))', re.DOTALL)
-    
+    # Globaler Cache für extrahierte Bild-XRefs, um Duplikate über Blöcke hinweg zu vermeiden
+    extracted_xrefs_global = set() 
+
     # Gehe durch alle Blöcke
-    for block_idx, block in enumerate(question_blocks):
-        block = block.strip()
-        if not block:
-            continue
+    for block_idx, block_info in enumerate(question_blocks_info):
+        block_text = block_info["text"]
+        block_start_index = block_info["start"]
+        block_end_index = block_info["end"]
         
         # Extrahiere die Fragenummer und den Fragetext
-        question_match = question_pattern.search(block)
-        if not question_match:
-            # Alternative Fragemuster
-            alt_match = re.search(r'(?:Was|Welche|Wo|Wann|Wie|Warum).*?\?', block, re.DOTALL)
-            if alt_match:
-                question_text = alt_match.group(0).strip()
-                logger.info(f"Alternative Frage gefunden (Block {block_idx+1}): {question_text[:50]}")
-                
-                question_data = {
-                    "id": str(uuid.uuid4()),
-                    "page": -1,  # Später zuweisen
-                    "y": 0,      # Später zuweisen
-                    "full_text": block,
-                    "question_number": str(block_idx + 1),
-                    "question": question_text,
-                    "option_a": "", "option_b": "", "option_c": "", "option_d": "", "option_e": "",
-                    "subject": "", "correct_answer": "", "comment": ""
-                }
-                
-                # Extrahiere Optionen A-E
-                for letter in "ABCDE":
-                    option_match = re.search(rf'{letter}\)(.*?)(?=\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL)
-                    if option_match:
-                        question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
-                
-                questions.append(question_data)
-            continue
+        # ALT: question_pattern = re.compile(r'(\\d+)\\.\\s*Frage:?\\s*(.*?)(?=(?:\\s*[A-E]\\)|\\s*Fach:|\\s*Antwort:|\\s*Kommentar:|$))', re.DOTALL)
+        # ALT: question_match = question_pattern.search(block_text)
         
-        # Standardfall: "X. Frage: Text" Format
-        question_number = question_match.group(1)
-        question_text = question_match.group(2).strip()
-        
-        logger.info(f"Frage {question_number} gefunden: {question_text[:50]}")
-        
-        # Vorbereiten der Fragedaten
         question_data = {
             "id": str(uuid.uuid4()),
-            "page": -1,  # Später zuweisen
-            "y": 0,      # Später zuweisen
-            "full_text": block,
-            "question_number": question_number,
-            "question": question_text,
+            "page": -1, # Wird später gesetzt
+            "y": 0,     # Wird später gesetzt
+            "full_text": block_text, # Behalte den Blocktext für Debugging
+            "question_number": str(block_idx + 1), # Fallback Nummerierung
+            "question": "",
             "option_a": "", "option_b": "", "option_c": "", "option_d": "", "option_e": "",
-            "subject": "", "correct_answer": "", "comment": ""
+            "subject": "", "correct_answer": "", "comment": "",
+            "image_key": None, # Platzhalter für Bild
+            "image_bytes": None,
+            "image_ext": None
         }
+
+        # --- NEUE LOGIK zur Erkennung von Frage, Optionen und Metadaten ---
         
-        # Extrahiere Optionen A-E
-        for letter in "ABCDE":
-            option_match = re.search(rf'{letter}\)(.*?)(?=\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL)
-            if option_match:
-                question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
+        # 1. Finde Question Number und Start
+        question_start_match = re.search(r'^(\\d+)\\.\\s*Frage:?', block_text, re.MULTILINE)
         
-        # Extrahiere Metadaten
-        fach_match = re.search(r'Fach:\s*(.*?)(?=\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL)
-        if fach_match:
-            question_data["subject"] = fach_match.group(1).strip()
+        if question_start_match:
+            question_data["question_number"] = question_start_match.group(1)
+            question_start_offset = question_start_match.end()
+
+            # 2. Finde Ende des Question Body (Beginn der Metadaten am Ende des Blocks)
+            # Suche nach Fach/Antwort/Kommentar, die typischerweise am Ende stehen
+            metadata_start_offset = len(block_text) # Default: Ende des Blocks
+            # Suche von hinten nach dem frühesten Metadaten-Tag
+            for keyword in ["Fach:", "Antwort:", "Kommentar:"]:
+                 try:
+                     # re.IGNORECASE hinzugefügt
+                     match_offset = block_text.rindex(keyword, 0, len(block_text), re.IGNORECASE) 
+                     # Finde den Zeilenanfang des Keywords
+                     line_start_offset = block_text.rfind('\n', 0, match_offset) + 1
+                     metadata_start_offset = min(metadata_start_offset, line_start_offset)
+                 except ValueError:
+                     pass # Keyword nicht gefunden
+
+            full_question_body = block_text[question_start_offset:metadata_start_offset].strip()
+            metadata_body = block_text[metadata_start_offset:].strip()
+
+            # 3. Extrahiere A-E Optionen vom ENDE des full_question_body
+            options_text = ""
+            question_text_final = full_question_body # Default: alles ist Frage
+            
+            lines = full_question_body.split('\n')
+            option_lines_indices = []
+            # Suche rückwärts nach dem Block der Optionen A-E
+            for i in range(len(lines) - 1, -1, -1):
+                line = lines[i].strip()
+                if re.match(r'^[A-E]\)', line):
+                    option_lines_indices.insert(0, i) # Füge am Anfang hinzu, um Reihenfolge zu wahren
+                elif option_lines_indices and line: # Wenn wir Optionen gefunden haben und auf eine nicht-leere Nicht-Optionszeile stoßen
+                    break # Der Block der Optionen ist zu Ende
+                elif not option_lines_indices and line: # Wenn wir noch keine Optionen gefunden haben und auf Text stoßen
+                     pass # Weitersuchen nach oben
+            
+            if option_lines_indices:
+                first_option_line_index = option_lines_indices[0]
+                options_text = '\n'.join(lines[first_option_line_index:]).strip()
+                question_text_final = '\n'.join(lines[:first_option_line_index]).strip() # Text vor den Optionen
+                
+                # Extrahiere individuelle Optionen aus options_text
+                for letter in "ABCDE":
+                    # Regex sucht nach A), B) etc. am Zeilenanfang im Optionsblock
+                    option_match = re.search(rf'^{letter}\\)\\s*(.*?)(?=\\s*(?:^\\s*[A-E]\\)|$)', options_text, re.MULTILINE | re.DOTALL)
+                    if option_match:
+                        question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
+            else:
+                # Keine A-E Optionen am Ende gefunden, versuche Fallback (weniger zuverlässig)
+                 logger.warning(f"Keine A)-E) Optionen am Ende von Frage {question_data['question_number']} gefunden. Suche im gesamten Body.")
+                 for letter in "ABCDE":
+                     option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*(?:[A-E]\\)|Fach:|Antwort:|Kommentar:)|$)', full_question_body, re.DOTALL)
+                     if option_match:
+                         question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
+
+            question_data["question"] = question_text_final
+            logger.info(f"Block {block_idx+1}: Frage {question_data['question_number']} erkannt. Body bis Optionen: '{question_text_final[:80].replace('\n',' ')}...' Optionen gefunden: {bool(options_text)}")
+
+            # 4. Extrahiere Metadaten aus metadata_body
+            fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', metadata_body, re.DOTALL | re.IGNORECASE)
+            if fach_match: question_data["subject"] = fach_match.group(1).strip()
+            
+            antwort_match = re.search(r'Antwort:\\s*(.*?)(?=\\s*Fach:|\\s*Kommentar:|$)', metadata_body, re.DOTALL | re.IGNORECASE)
+            if antwort_match: question_data["correct_answer"] = antwort_match.group(1).strip()
+            
+            kommentar_match = re.search(r'Kommentar:\\s*(.*?)(?=\\s*Fach:|\\s*Antwort:|$)', metadata_body, re.DOTALL | re.IGNORECASE)
+            if kommentar_match: question_data["comment"] = kommentar_match.group(1).strip()
+
+        else:
+             # --- Fallback / Alternative Frageerkennung (wenn "X. Frage:" nicht am Anfang steht) ---
+             # Behalte die bisherige Logik für alternative Formate bei
+             alt_match = re.search(r'(?:Was|Welche|Wo|Wann|Wie|Warum).*?\\?', block_text, re.DOTALL | re.IGNORECASE)
+             if alt_match:
+                 question_data["question"] = alt_match.group(0).strip()
+                 logger.info(f"Block {block_idx+1}: Alternative Frage (?) gefunden: {question_data['question'][:60]}...")
+                 # Extrahiere Optionen/Meta auch hier (vereinfacht)
+                 for letter in "ABCDE":
+                     option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*(?:[A-E]\\)|Fach:|Antwort:|Kommentar:)|$)', block_text, re.DOTALL)
+                     if option_match: question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
+                 fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
+                 if fach_match: question_data["subject"] = fach_match.group(1).strip()
+                 antwort_match = re.search(r'Antwort:\\s*(.*?)(?=\\s*Fach:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
+                 if antwort_match: question_data["correct_answer"] = antwort_match.group(1).strip()
+                 kommentar_match = re.search(r'Kommentar:\\s*(.*?)(?=\\s*Fach:|\\s*Antwort:|$)', block_text, re.DOTALL | re.IGNORECASE)
+                 if kommentar_match: question_data["comment"] = kommentar_match.group(1).strip()
+             else: 
+                 first_line = block_text.split('\n')[0].strip()
+                 if not re.match(r'^(Fach|Antwort|Kommentar):', first_line, re.IGNORECASE):
+                     question_data["question"] = first_line
+                     logger.info(f"Block {block_idx+1}: Fallback-Frage (erste Zeile) verwendet: {question_data['question'][:60]}...")
+                     # Extrahiere Optionen/Meta auch hier (vereinfacht)
+                     for letter in "ABCDE":
+                        option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*(?:[A-E]\\)|Fach:|Antwort:|Kommentar:)|$)', block_text, re.DOTALL)
+                        if option_match: question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
+                     fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
+                     if fach_match: question_data["subject"] = fach_match.group(1).strip()
+                     antwort_match = re.search(r'Antwort:\\s*(.*?)(?=\\s*Fach:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
+                     if antwort_match: question_data["correct_answer"] = antwort_match.group(1).strip()
+                     kommentar_match = re.search(r'Kommentar:\\s*(.*?)(?=\\s*Fach:|\\s*Antwort:|$)', block_text, re.DOTALL | re.IGNORECASE)
+                     if kommentar_match: question_data["comment"] = kommentar_match.group(1).strip()
+                 else:
+                     logger.warning(f"Block {block_idx+1}: Konnte keine klare Frage extrahieren.")
+                     # Frage bleibt leer, aber Block wird trotzdem für Bildsuche etc. behalten
         
-        antwort_match = re.search(r'Antwort:\s*(.*?)(?=\s*Fach:|\s*Kommentar:|$)', block, re.DOTALL)
-        if antwort_match:
-            question_data["correct_answer"] = antwort_match.group(1).strip()
+        # --- PRÜFUNG: Leere Frage überspringen ---
+        is_question_empty = not question_data["question"] or question_data["question"].isspace()
+        are_options_empty = all(
+            (not question_data.get(f"option_{l}") or question_data.get(f"option_{l}").isspace()) 
+            for l in "abcde"
+        )
         
-        kommentar_match = re.search(r'Kommentar:\s*(.*?)(?=\s*Fach:|\s*Antwort:|$)', block, re.DOTALL)
-        if kommentar_match:
-            question_data["comment"] = kommentar_match.group(1).strip()
+        if is_question_empty and are_options_empty:
+            logger.warning(f"Block {block_idx+1} (Nummer {question_data['question_number']}) wird übersprungen, da Frage und Optionen leer sind.")
+            continue # Zum nächsten Block gehen
         
+        # --- Ende: NEUE LOGIK ---
+        
+        # --- Entferne alte Options/Meta-Extraktion (ist jetzt oben integriert) ---
+        # for letter in "ABCDE":
+        # ... (alter Code entfernt) ...
+        # fach_match = ... 
+        # antwort_match = ...
+        # kommentar_match = ...
+        
+        # --- Beginn: Bildsuche und -zuordnung innerhalb des Blocks (Unverändert) ---
+        found_image_in_block = False
+        block_page_indices = set() # Seiten, die Text dieses Blocks enthalten
+
+        # 1. Finde heraus, welche Seiten den Text dieses Blocks enthalten
+        relevant_pages = []
+        for p_info in page_texts:
+             # Prüfe auf Überlappung der Zeichenindizes
+             if max(block_start_index, p_info["index"]) < min(block_end_index, p_info["index"] + len(p_info["text"])):
+                 block_page_indices.add(p_info["page_idx"])
+                 relevant_pages.append(p_info["page_idx"])
+        
+        # Wenn Seiten gefunden wurden, setze die erste als Hauptseite der Frage
+        if relevant_pages:
+            question_data["page"] = min(relevant_pages)
+            # Versuche Y-Position der Frage auf der Seite zu finden (Approximation)
+            try:
+                 page_text_for_y = doc[question_data["page"]].get_text("text")
+                 # Suche nach Anfang der Frage oder ersten Zeile des Blocks
+                 search_term = question_data["question"][:30] if question_data["question"] else block_text.split('\n')[0][:30]
+                 pos = page_text_for_y.find(search_term)
+                 if pos != -1:
+                     # Schätze Y basierend auf Zeichenposition (sehr ungenau)
+                     page_height = doc[question_data["page"]].rect.height
+                     estimated_y = (pos / len(page_text_for_y)) * page_height if len(page_text_for_y) > 0 else 0
+                     question_data["y"] = estimated_y
+                     #logger.info(f"Geschätzte Y-Position für Frage {question_data['question_number']} auf Seite {question_data['page']}: {estimated_y:.0f}")
+            except Exception as e_y:
+                 logger.warning(f"Fehler bei Schätzung der Y-Position für Frage {question_data['question_number']}: {e_y}")
+
+        # 2. Suche Bilder auf diesen Seiten und prüfe Zugehörigkeit zum Block
+        if relevant_pages:
+             for page_idx in sorted(list(relevant_pages)): # Gehe Seiten in Reihenfolge durch
+                 try:
+                     page = doc[page_idx]
+                     # Finde die Bounding Box des Textes, der *auf dieser Seite* zum Block gehört
+                     # Verwende page.get_text("blocks"), um Textblöcke mit Koordinaten zu erhalten
+                     page_block_rect = fitz.Rect() # BBox des Block-Texts auf dieser Seite
+                     page_text_blocks = page.get_text("blocks")
+                     
+                     # Finde den Start- und End-Index des Block-Texts *relativ* zum Seitenanfang
+                     page_start_in_full = page_texts[page_idx]["index"]
+                     rel_block_start = max(0, block_start_index - page_start_in_full)
+                     rel_block_end = min(len(page_texts[page_idx]["text"]), block_end_index - page_start_in_full)
+
+                     block_text_on_page = page_texts[page_idx]["text"][rel_block_start:rel_block_end]
+
+                     # Approximiere die BBox durch die Blöcke, die Teile des Texts enthalten (ungenau)
+                     # Bessere Methode: page.search_for, wenn der Text kurz genug ist.
+                     # Hier vereinfachte Annahme: Nutze die y-Koordinate der Frage als Anker
+                     
+                     # Einfachere Heuristik: Prüfe Bilder auf der Seite
+                     page_images = page.get_images(full=True)
+                     for img_info in page_images:
+                         xref = img_info[0]
+                         if xref in extracted_xrefs_global: continue # Schon global verarbeitet
+
+                         img_rect = page.get_image_bbox(img_info)
+                         if img_rect.is_empty: continue
+                         
+                         # Zugehörigkeitsprüfung: Liegt das Bild *nach* der geschätzten Y-Position der Frage
+                         # und *vor* der geschätzten Y-Position der *nächsten* Frage (oder Seitenende)?
+                         # Dies ist eine Annäherung an die Block-Zugehörigkeit.
+                         
+                         # Bedingung: Bild muss auf einer Seite des Blocks sein
+                         if page_idx in block_page_indices:
+                             # Prüfe, ob schon ein Bild zugeordnet wurde
+                             if not question_data["image_key"]: 
+                                 base_image = doc.extract_image(xref)
+                                 if base_image and len(base_image["image"]) > 100:
+                                     extracted_xrefs_global.add(xref) # Zum globalen Set hinzufügen
+                                     question_data["image_bytes"] = base_image["image"]
+                                     question_data["image_ext"] = base_image["ext"]
+                                     img_y_coord = int(img_rect.y0) # Verwende y0 als Teil des Schlüssels
+                                     question_data["image_key"] = f"{question_data['id']}_{page_idx}_{img_y_coord}.{base_image['ext']}"
+                                     # Update page/y basierend auf Bildposition
+                                     question_data["page"] = page_idx 
+                                     question_data["y"] = img_rect.y0 
+                                     logger.info(f"Bild (xref {xref}) auf Seite {page_idx+1} Frage {question_data['question_number']} im Block {block_idx+1} zugeordnet (Erstes Bild im Block). Key: {question_data['image_key']}")
+                                     found_image_in_block = True
+                                     break # Nur das erste Bild pro Block nehmen
+                 except Exception as e_img_search:
+                     logger.error(f"Fehler bei Bildsuche in Block {block_idx+1}, Seite {page_idx+1}: {e_img_search}")
+                 
+                 if found_image_in_block:
+                     break # Stoppe Seitensuche für diesen Block, wenn Bild gefunden wurde
+
         questions.append(question_data)
-    
-    # Suche in allen Seiten nach "X. Frage:" für Seitenzuordnung
-    for q in questions:
-        search_pattern = f"{q['question_number']}. Frage:"
-        for page_idx in range(len(doc)):
-            page_text = doc[page_idx].get_text()
-            if search_pattern in page_text:
-                q["page"] = page_idx
-                # Schätze y-Position 
-                q["y"] = page_text.find(search_pattern) / len(page_text) * 800
-                break
-    
-    # Zweite Variante: Wenn keine oder nur wenige Fragen gefunden wurden, suche nach Fragezeichen-Sätzen
-    if len(questions) < 5:
-        logger.warning(f"Nur {len(questions)} Fragen gefunden. Versuche alternativen Ansatz...")
         
-        question_sentences = re.findall(r'(?:[^.!?]*?(?:Was|Welche|Wo|Wann|Wie|Warum)[^.!?]*?\?)', full_text)
-        valid_sentences = [s.strip() for s in question_sentences if len(s.strip()) > 20]
-        
-        for idx, sentence in enumerate(valid_sentences, start=len(questions)+1):
-            questions.append({
-                "id": str(uuid.uuid4()),
-                "page": -1,
-                "y": 0,
-                "full_text": sentence,
-                "question_number": str(idx),
-                "question": sentence,
-                "option_a": "", "option_b": "", "option_c": "", "option_d": "", "option_e": "",
-                "subject": "", "correct_answer": "", "comment": ""
-            })
+    try:
+        doc.close() # Dokument schließen
+    except Exception as e_close:
+        logger.warning(f"Fehler beim Schließen des PDF-Dokuments: {e_close}")
     
-    logger.info(f"Insgesamt {len(questions)} Fragen extrahiert")
+    logger.info(f"Insgesamt {len(questions)} Fragen extrahiert, {sum(1 for q in questions if q['image_key'])} davon mit direkt zugeordneten Bildern.")
     return questions
 
 def parse_question_details(question):
