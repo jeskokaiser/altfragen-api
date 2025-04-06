@@ -1113,17 +1113,27 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
             
             questions.append(question_data)
         
-        # Suche in allen Seiten nach "X. Frage:" für Seitenzuordnung
+        # Suche in allen Seiten nach "X. Frage:" für Seitenzuordnung und genaue Y-Position
         for q in questions:
-            search_pattern = f"{q['question_number']}. Frage:"
-            for page_idx in range(len(doc)):
-                page_text = doc[page_idx].get_text()
-                if search_pattern in page_text:
-                    q["page"] = page_idx
-                    # Schätze y-Position 
-                    q["y"] = page_text.find(search_pattern) / len(page_text) * 800
-                    break
-        
+            # Nur suchen, wenn Seite/Y noch nicht exakt bestimmt wurden (oder zur Verfeinerung)
+            if q.get("page", -1) == -1 or q.get("y", 0) <= 0:
+                search_pattern = f"{q['question_number']}. Frage:"
+                found = False
+                for page_idx in range(len(doc)):
+                    page = doc[page_idx]
+                    # Suche nach dem genauen Text
+                    search_results = page.search_for(search_pattern, quads=True)
+                    if search_results:
+                        # Nimm die Y-Koordinate des ersten Treffers
+                        first_rect = search_results[0] # fitz.Rect
+                        q["page"] = page_idx
+                        q["y"] = first_rect.y0 # Genauere Y-Position (oben)
+                        logger.info(f"Frage {q['question_number']} exakt auf Seite {page_idx+1} bei Y={q['y']:.2f} gefunden.")
+                        found = True
+                        break # Stoppe Suche nach erstem Treffer
+                if not found:
+                    logger.warning(f"Konnte exakte Position für Frage {q['question_number']} nicht finden. Schätzung: Y={q.get('y', 0)}")
+
         # Zweite Variante: Wenn keine oder nur wenige Fragen gefunden wurden, suche nach Fragezeichen-Sätzen
         if len(questions) < 5:
             logger.warning(f"Nur {len(questions)} Fragen gefunden. Versuche alternativen Ansatz (Fragezeichen)...")
