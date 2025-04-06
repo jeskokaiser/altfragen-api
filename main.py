@@ -1097,8 +1097,10 @@ def extract_questions_with_coords(pdf_path):
             # Suche von hinten nach dem frühesten Metadaten-Tag
             for keyword in ["Fach:", "Antwort:", "Kommentar:"]:
                  try:
-                     # re.IGNORECASE hinzugefügt
-                     match_offset = block_text.rindex(keyword, 0, len(block_text), re.IGNORECASE) 
+                     # Suche case-insensitive mit lower() statt re.IGNORECASE in rindex
+                     keyword_lower = keyword.lower()
+                     block_lower = block_text.lower()
+                     match_offset = block_lower.rindex(keyword_lower) # Finde letzte Position im Lowercase-Text
                      # Finde den Zeilenanfang des Keywords
                      line_start_offset = block_text.rfind('\n', 0, match_offset) + 1
                      metadata_start_offset = min(metadata_start_offset, line_start_offset)
