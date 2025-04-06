@@ -1114,25 +1114,49 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
             questions.append(question_data)
         
         # Suche in allen Seiten nach "X. Frage:" für Seitenzuordnung und genaue Y-Position
-        for q in questions:
-            # Nur suchen, wenn Seite/Y noch nicht exakt bestimmt wurden (oder zur Verfeinerung)
+        # Sortiere Fragen nach Seite und Nummer für die y1-Bestimmung
+        questions.sort(key=lambda q: (q.get("page", float('inf')), int(q.get("question_number", 0))))
+
+        for i, q in enumerate(questions):
+            # Nur suchen, wenn Seite/Y noch nicht exakt bestimmt wurden
             if q.get("page", -1) == -1 or q.get("y", 0) <= 0:
                 search_pattern = f"{q['question_number']}. Frage:"
                 found = False
                 for page_idx in range(len(doc)):
                     page = doc[page_idx]
-                    # Suche nach dem genauen Text
                     search_results = page.search_for(search_pattern, quads=True)
                     if search_results:
-                        # Nimm die Y-Koordinate des ersten Treffers
-                        first_rect = search_results[0] # fitz.Rect
+                        first_quad = search_results[0] # Dies ist ein Quad-Objekt
                         q["page"] = page_idx
-                        q["y"] = first_rect.y0 # Genauere Y-Position (oben)
+                        q["y"] = first_quad.ul.y # Genauere Y-Position (oben)
+                        # Speichere auch y1 (unten) des Suchbegriffs
+                        q["y1_search_term"] = first_quad.ll.y
                         logger.info(f"Frage {q['question_number']} exakt auf Seite {page_idx+1} bei Y={q['y']:.2f} gefunden.")
                         found = True
-                        break # Stoppe Suche nach erstem Treffer
+                        break
                 if not found:
                     logger.warning(f"Konnte exakte Position für Frage {q['question_number']} nicht finden. Schätzung: Y={q.get('y', 0)}")
+
+        # Schätze y1 (untere Grenze) für jede Frage basierend auf der nächsten Frage
+        page_heights = {p: doc[p].rect.height for p in range(len(doc))}
+        for i, q in enumerate(questions):
+            if q.get("page", -1) != -1:
+                next_q_y0 = float('inf')
+                # Suche die nächste Frage auf derselben Seite
+                for j in range(i + 1, len(questions)):
+                    next_q = questions[j]
+                    if next_q.get("page", -1) == q["page"]:
+                        next_q_y0 = next_q.get("y", float('inf'))
+                        break
+
+                # Setze y1 kurz vor die nächste Frage oder ans Seitenende
+                page_end = page_heights.get(q["page"], 842) # Standard A4 Höhe
+                # Verwende y1 des Suchbegriffs als Minimum, falls verfügbar
+                start_y = q.get("y1_search_term", q.get("y", 0))
+                q["y1"] = min(next_q_y0 - 5, page_end - 10) if next_q_y0 != float('inf') else page_end - 10
+                # Stelle sicher, dass y1 nach dem Suchbegriff liegt
+                q["y1"] = max(q["y1"], start_y + 10) # Mindestens 10 Punkte Höhe
+                logger.debug(f"Frage {q.get('question_number')}: Seite {q.get('page')+1}, Bereich geschätzt: Y0={q.get('y'):.2f}, Y1={q.get('y1'):.2f}")
 
         # Zweite Variante: Wenn keine oder nur wenige Fragen gefunden wurden, suche nach Fragezeichen-Sätzen
         if len(questions) < 5:
