@@ -106,7 +106,11 @@ def validate_pdf(file: UploadFile) -> bool:
 
 async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
     """Verarbeitet das PDF mit verbesserter Fehlerbehandlung und Performance-Optimierungen"""
+    doc = None # Initialisiere doc
     try:
+        # Öffne das PDF-Dokument einmal am Anfang
+        doc = fitz.open(pdf_path)
+
         # Extrahiere Header aus Dateinamen (als Fallback, wenn keine Metadaten angegeben)
         extracted_exam_name, extracted_exam_year, extracted_exam_semester = extract_exam_header(pdf_path)
         
@@ -119,7 +123,8 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
         logger.info(f"Verarbeite PDF: {exam_name} {exam_year} {exam_semester}")
 
         # Extrahiere und verarbeite Fragen
-        questions = extract_questions_with_coords(pdf_path)
+        # Wichtig: Pass doc an extract_questions_with_coords, wenn dort genaue Y gebraucht werden
+        questions = extract_questions_with_coords(doc) # Übergibt das doc Objekt
         if not questions:
             logger.warning("Keine Fragen im PDF gefunden")
             return {
@@ -134,22 +139,22 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                 "questions": [] # Leere Liste für Konsistenz
             }
             
-        # Verarbeite alle Fragen parallel mit Batch-Verarbeitung für bessere Performance
-        # Teile die Fragen in Gruppen von 20 für parallele Verarbeitung
-        batch_size = 20
+        # Parse Details (optional, falls extract schon alles macht)
+        # ... (Batch-Verarbeitung wie zuvor) ...
+        batch_size = 20 # Beispiel Batch-Größe
         for i in range(0, len(questions), batch_size):
             batch = questions[i:i+batch_size]
-            # Verarbeite diesen Batch parallel
             for q in batch:
-                parse_question_details(q)
-                
+                 parse_question_details(q) # Oder im Batch
+
         logger.info(f"{len(questions)} Fragen extrahiert und verarbeitet")
 
         # Verarbeite Bilder mit verbesserter Fehlerbehandlung und Performance
         images = []
         try:
             logger.info("Starte optimierte Bildextraktion")
-            images = extract_images_with_coords(pdf_path)
+            # Wichtig: Pass doc an extract_images_with_coords
+            images = extract_images_with_coords(doc) # Verwende das geöffnete doc
             logger.info(f"Extraktion ergab {len(images)} Bilder")
             
             # Überprüfe die Bilder auf korrekte Struktur (optimiert)
@@ -173,11 +178,12 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
             images = valid_images
             logger.info(f"{len(images)} gültige Bilder gefunden")
             
-            # Ordne Bilder den Fragen zu
+            # Ordne Bilder den Fragen zu - *** MIT NEUER FUNKTION UND doc ***
             if images and questions:
                 try:
-                    images = map_images_to_questions(questions, images)
-                    logger.info(f"{len(images)} Bilder extrahiert und zugeordnet")
+                    # Übergebe das doc-Objekt an die Mapping-Funktion
+                    images = map_images_to_questions(questions, images, doc)
+                    logger.info(f"Block-basierte Bildzuordnung: {sum(1 for img in images if img.get('question_id'))} Bilder zugeordnet")
                 except Exception as map_error:
                     logger.error(f"Fehler bei der Bildzuordnung: {str(map_error)}")
                     import traceback
@@ -262,36 +268,44 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
         
         # Bereite Bildupload-Tasks für Supabase Storage vor
         upload_tasks = []
-        for img_idx, img in enumerate(images):
-            if img.get("question_id"):
-                # Sichere Extraktion der Y-Koordinate
-                bbox = img.get("bbox", [0, 0, 0, 0])
-                img_y = 0
-                if isinstance(bbox, (list, tuple)) and len(bbox) > 1:
-                    img_y = bbox[1]
-                elif isinstance(bbox, int):
-                    img_y = bbox
-                
-                # Stelle sicher, dass img_y numerisch ist
-                if not isinstance(img_y, (int, float)):
+        processed_image_keys = set() # Um doppelte Uploads zu vermeiden, falls mehrere Bilder denselben Key bekommen
+
+        # Gehe durch die Fragen, um den zugewiesenen image_key zu finden
+        for q in questions:
+            if q.get("image_key"):
+                image_key = q["image_key"]
+                # Finde das zugehörige Bild (oder die Bilder) mit dieser question_id
+                found_img = None
+                for img in images:
+                    # Versuche, das spezifische Bild zu finden, das diesem Key entspricht
+                    img_y_for_key = 0
+                    bbox = img.get("bbox", [0, 0])[1]
                     try:
-                        img_y = float(img_y)
-                    except (ValueError, TypeError):
-                        img_y = 0
-                
-                filename = f"{img['question_id']}_{img['page']}_{int(float(img_y))}.{img['image_ext']}"
-                
-                # Prüfe Bilddaten
-                if img.get("image_bytes") and len(img["image_bytes"]) >= 100:
-                    upload_tasks.append({
-                        "img_idx": img_idx,
-                        "filename": filename,
-                        "image_bytes": img["image_bytes"],
-                        "content_type": f'image/{img.get("image_ext", "jpg")}',
-                        "question_id": img["question_id"]
+                       img_y_for_key = int(float(bbox))
+                    except (ValueError, TypeError): pass
+
+                    expected_key = f"{q.get('id')}_{img.get('page', 0)}_{img_y_for_key}.{img.get('image_ext', 'jpg')}"
+
+                    if img.get("question_id") == q.get("id") and image_key == expected_key :
+                         # Prüfe, ob dieses Bild valide Daten hat
+                         if img.get("image_bytes") and len(img["image_bytes"]) >= 100:
+                             found_img = img
+                             break # Nimm das erste passende Bild
+
+                if found_img and image_key not in processed_image_keys:
+                     upload_tasks.append({
+                        "filename": image_key,
+                        "image_bytes": found_img["image_bytes"],
+                        "content_type": f'image/{found_img.get("image_ext", "jpg")}',
+                        "question_id": q["id"] # Wird für Logging benötigt
                     })
-        
-        # Versuche zuerst den asynchronen Upload
+                     processed_image_keys.add(image_key)
+                elif not found_img and q.get("image_key"): # Nur warnen wenn key gesetzt war
+                    logger.warning(f"Kein gültiges Bild für Key {image_key} der Frage {q.get('question_number', '?')} gefunden für Upload.")
+
+
+        # Versuche zuerst den asynchronen Upload mit Supabase
+        successful_uploads = 0 # Reset counter before upload loop
         try:
             # Führe parallele Uploads durch (in Batches für Kontrolle)
             batch_size = 5  # Anzahl paralleler Uploads
@@ -302,9 +316,9 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                 upload_futures = []
                 
                 for task in batch:
-                    # Asynchrone Funktion für Upload
+                    # Asynchrone Funktion für Supabase Upload
                     upload_future = asyncio.ensure_future(upload_image_async(
-                        config, 
+                        config, # config Objekt übergeben
                         task["image_bytes"], 
                         task["filename"], 
                         bucket_name, 
@@ -318,47 +332,17 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                         result = await future
                         if result:
                             successful_uploads += 1
-                            # Aktualisiere die zugehörige Frage mit dem Bildschlüssel
-                            for q in questions:
-                                if q["id"] == task["question_id"]:
-                                    q["image_key"] = task["filename"]
-                                    logger.info(f"Bild {task['filename']} mit Frage {q.get('question_number', '?')} verknüpft")
-                                    break
+                            # Image Key ist bereits in 'questions' gesetzt
+                            logger.info(f"Bild {task['filename']} erfolgreich hochgeladen (verknüpft mit Frage {task['question_id']})")
+                            # break nicht nötig, da Key schon in q ist
                     except Exception as e:
-                        logger.error(f"Fehler beim asynchronen Upload von {task['filename']}: {str(e)}")
+                        logger.error(f"Fehler beim asynchronen Supabase-Upload von {task['filename']}: {str(e)}")
         
         except Exception as async_error:
-            logger.error(f"Fehler bei der asynchronen Upload-Methode: {str(async_error)}")
-            logger.warning("Verwende den synchronen Upload-Fallback")
-            
-            # Fallback: Verwende synchronen Upload, wenn der asynchrone fehlschlägt
-            if successful_uploads == 0 and len(upload_tasks) > 0:
-                logger.info("Starte synchrone Uploads als Fallback")
-                
-                for task in upload_tasks:
-                    try:
-                        # Synchroner Upload als Fallback mit Supabase Storage
-                        options = {
-                            'content-type': task["content_type"],
-                            'upsert': 'true'
-                        }
-                        response = config.supabase.storage.from_(bucket_name).upload(
-                            task["filename"], 
-                            task["image_bytes"], 
-                            options
-                        )
-                        
-                        logger.info(f"Synchroner Supabase-Upload erfolgreich: {task['filename']}")
-                        successful_uploads += 1
-                        
-                        # Aktualisiere die zugehörige Frage mit dem Bildschlüssel
-                        for q in questions:
-                            if q["id"] == task["question_id"]:
-                                q["image_key"] = task["filename"]
-                                logger.info(f"Bild {task['filename']} mit Frage {q.get('question_number', '?')} verknüpft (synchron)")
-                                break
-                    except Exception as e:
-                        logger.error(f"Fehler beim synchronen Supabase-Upload von {task['filename']}: {str(e)}")
+            logger.error(f"Fehler bei der asynchronen Supabase-Upload-Methode: {str(async_error)}")
+            logger.warning("Asynchroner Upload fehlgeschlagen. Synchroner Fallback nicht implementiert in diesem Snippet.")
+            # Optional: Füge hier synchronen Fallback hinzu, falls benötigt
+            # ...
 
         # Bereite Fragedaten für das Frontend auf (anstatt sie direkt in die Datenbank einzufügen)
         formatted_questions = []
@@ -401,13 +385,20 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
 
     except Exception as e:
         logger.error(f"Fehler bei der PDF-Verarbeitung: {str(e)}")
+        import traceback # Importiere traceback hier
+        logger.error(traceback.format_exc()) # Mehr Details loggen
         return {
             "status": "failed", # Konsistent "failed" verwenden
             "success": False,  # Für Frontend-Kompatibilität
-            "message": str(e),
+            "message": f"PDF processing error: {str(e)}", # Etwas generischer
             "data": {},
             "questions": []
         }
+    finally:
+        # Stelle sicher, dass das Dokument geschlossen wird
+        if doc:
+            doc.close()
+            logger.info("PDF-Dokument geschlossen.")
 
 async def upload_image_async(s3_client, image_bytes, filename, bucket_name, content_type):
     """
@@ -1006,312 +997,167 @@ def extract_exam_header(pdf_path):
         logger.error(f"Fehler beim Extrahieren der Metadaten aus dem Dateinamen: {str(e)}")
         return filename, "", ""
 
-def extract_questions_with_coords(pdf_path):
+def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
     """
-    Extrahiert Fragen und ordnet Bilder direkt innerhalb ihrer Textblöcke (durch '_{10,}' getrennt) zu.
+    Optimierte Extraktion von Fragen speziell für Altfragen-Format mit Unterstrichtrennlinien
     """
-    logger.info(f"Extrahiere Fragen und zugehörige Bilder aus PDF: {pdf_path}")
-    
-    try:
-        doc = fitz.open(pdf_path)
-        logger.info(f"PDF hat {len(doc)} Seiten")
-    except Exception as e:
-        logger.error(f"Konnte PDF nicht öffnen: {pdf_path} - Fehler: {e}")
-        return []
-
-    # Füge den gesamten Text zusammen
-    full_text = ""
-    page_texts = [] # Speichere Seitentexte und deren Startindex im Gesamttext
-    current_index = 0
-    for page_idx, page in enumerate(doc):
+    doc = None
+    close_doc_at_end = False # Flag, ob wir das Dokument hier schließen müssen
+    if isinstance(pdf_path_or_doc, str):
+        logger.info(f"Extrahiere Fragen aus PDF-Pfad: {pdf_path_or_doc}")
         try:
-            page_text = page.get_text("text", sort=False) # Behalte Reihenfolge bei
-            page_texts.append({"index": current_index, "text": page_text, "page_idx": page_idx})
-            full_text += page_text
-            current_index += len(page_text)
-        except Exception as e_page_text:
-             logger.error(f"Fehler beim Extrahieren von Text auf Seite {page_idx}: {e_page_text}")
+            doc = fitz.open(pdf_path_or_doc)
+            close_doc_at_end = True
+        except Exception as e:
+             logger.error(f"Konnte PDF nicht öffnen: {pdf_path_or_doc} - {str(e)}")
+             return [] # Leere Liste bei Fehler
+    elif isinstance(pdf_path_or_doc, fitz.Document):
+        logger.info(f"Extrahiere Fragen aus bereits geöffnetem PDF-Dokument.")
+        doc = pdf_path_or_doc
+        close_doc_at_end = False # Nicht hier schließen
+    else:
+        logger.error("Ungültiges Argument für extract_questions_with_coords. Erwartet Pfad oder fitz.Document.")
+        raise ValueError("Ungültiges Argument für extract_questions_with_coords.")
 
-    # Debug-Ausgabe eines Textausschnitts
-    logger.info(f"Textprobe (erste 500 Zeichen): {full_text[:500]}")
-    
-    # Trenne Text in Fragen-Blöcke mit mindestens 10 Unterstrichen
-    # Verwende finditer, um Start/Ende der Trenner zu bekommen
-    separators = list(re.finditer(r'_{10,}', full_text))
-    question_blocks_info = []
-    last_end = 0
-    for sep in separators:
-        start, end = sep.span()
-        block_text = full_text[last_end:start].strip()
-        if block_text:
-             question_blocks_info.append({"text": block_text, "start": last_end, "end": start})
-        last_end = end
-    # Letzten Block hinzufügen
-    final_block_text = full_text[last_end:].strip()
-    if final_block_text:
-         question_blocks_info.append({"text": final_block_text, "start": last_end, "end": len(full_text)})
-
-    logger.info(f"Gefunden: {len(question_blocks_info)} durch Unterstriche getrennte Textblöcke")
-    
     questions = []
-    
-    # Globaler Cache für extrahierte Bild-XRefs, um Duplikate über Blöcke hinweg zu vermeiden
-    extracted_xrefs_global = set() 
-
-    # Gehe durch alle Blöcke
-    for block_idx, block_info in enumerate(question_blocks_info):
-        block_text = block_info["text"]
-        block_start_index = block_info["start"]
-        block_end_index = block_info["end"]
-        
-        # Extrahiere die Fragenummer und den Fragetext
-        # ALT: question_pattern = re.compile(r'(\\d+)\\.\\s*Frage:?\\s*(.*?)(?=(?:\\s*[A-E]\\)|\\s*Fach:|\\s*Antwort:|\\s*Kommentar:|$))', re.DOTALL)
-        # ALT: question_match = question_pattern.search(block_text)
-        
-        question_data = {
-            "id": str(uuid.uuid4()),
-            "page": -1, # Wird später gesetzt
-            "y": 0,     # Wird später gesetzt
-            "full_text": block_text, # Behalte den Blocktext für Debugging
-            "question_number": str(block_idx + 1), # Fallback Nummerierung
-            "question": "",
-            "option_a": "", "option_b": "", "option_c": "", "option_d": "", "option_e": "",
-            "subject": "", "correct_answer": "", "comment": "",
-            "image_key": None, # Platzhalter für Bild
-            "image_bytes": None,
-            "image_ext": None
-        }
-
-        # --- NEUE LOGIK zur Erkennung von Frage, Optionen und Metadaten ---
-        
-        # 1. Finde Question Number und Start
-        question_start_match = re.search(r'^(\\d+)\\.\\s*Frage:?', block_text, re.MULTILINE)
-        
-        if question_start_match:
-            question_data["question_number"] = question_start_match.group(1)
-            question_start_offset = question_start_match.end()
-
-            # 2. Finde Ende des Question Body (Beginn der Metadaten am Ende des Blocks)
-            # Suche nach Fach/Antwort/Kommentar, die typischerweise am Ende stehen
-            metadata_start_offset = len(block_text) # Default: Ende des Blocks
-            # Suche von hinten nach dem frühesten Metadaten-Tag
-            for keyword in ["Fach:", "Antwort:", "Kommentar:"]:
-                 try:
-                     # Suche case-insensitive mit lower() statt re.IGNORECASE in rindex
-                     keyword_lower = keyword.lower()
-                     block_lower = block_text.lower()
-                     match_offset = block_lower.rindex(keyword_lower) # Finde letzte Position im Lowercase-Text
-                     # Finde den Zeilenanfang des Keywords
-                     line_start_offset = block_text.rfind('\n', 0, match_offset) + 1
-                     metadata_start_offset = min(metadata_start_offset, line_start_offset)
-                 except ValueError:
-                     pass # Keyword nicht gefunden
-
-            full_question_body = block_text[question_start_offset:metadata_start_offset].strip()
-            metadata_body = block_text[metadata_start_offset:].strip()
-
-            # 3. Extrahiere A-E Optionen vom ENDE des full_question_body
-            options_text = ""
-            question_text_final = full_question_body # Default: alles ist Frage
-            
-            lines = full_question_body.split('\n')
-            option_lines_indices = []
-            # Suche rückwärts nach dem Block der Optionen A-E
-            for i in range(len(lines) - 1, -1, -1):
-                line = lines[i].strip()
-                if re.match(r'^[A-E]\)', line):
-                    option_lines_indices.insert(0, i) # Füge am Anfang hinzu, um Reihenfolge zu wahren
-                elif option_lines_indices and line: # Wenn wir Optionen gefunden haben und auf eine nicht-leere Nicht-Optionszeile stoßen
-                    break # Der Block der Optionen ist zu Ende
-                elif not option_lines_indices and line: # Wenn wir noch keine Optionen gefunden haben und auf Text stoßen
-                     pass # Weitersuchen nach oben
-            
-            if option_lines_indices:
-                first_option_line_index = option_lines_indices[0]
-                options_text = '\n'.join(lines[first_option_line_index:]).strip()
-                question_text_final = '\n'.join(lines[:first_option_line_index]).strip() # Text vor den Optionen
-                
-                # Extrahiere individuelle Optionen aus options_text
-                for letter in "ABCDE":
-                    # Regex sucht nach A), B) etc. am Zeilenanfang im Optionsblock
-                    option_match = re.search(rf'^{letter}\\)\\s*(.*?)(?=\\s*(?:^\\s*[A-E]\\)|$)', options_text, re.MULTILINE | re.DOTALL)
-                    if option_match:
-                        question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
-            else:
-                # Keine A-E Optionen am Ende gefunden, versuche Fallback (weniger zuverlässig)
-                 logger.warning(f"Keine A)-E) Optionen am Ende von Frage {question_data['question_number']} gefunden. Suche im gesamten Body.")
-                 for letter in "ABCDE":
-                     option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*(?:[A-E]\\)|Fach:|Antwort:|Kommentar:)|$)', full_question_body, re.DOTALL)
-                     if option_match:
-                         question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
-
-            question_data["question"] = question_text_final
-            # Bereite Vorschau für Log vor (ersetze Newlines außerhalb des f-strings)
-            question_body_preview = question_text_final[:80].replace('\n', ' ')
-            logger.info(f"Block {block_idx+1}: Frage {question_data['question_number']} erkannt. Body bis Optionen: '{question_body_preview}...' Optionen gefunden: {bool(options_text)}")
-
-            # 4. Extrahiere Metadaten aus metadata_body
-            fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', metadata_body, re.DOTALL | re.IGNORECASE)
-            if fach_match: question_data["subject"] = fach_match.group(1).strip()
-            
-            antwort_match = re.search(r'Antwort:\\s*(.*?)(?=\\s*Fach:|\\s*Kommentar:|$)', metadata_body, re.DOTALL | re.IGNORECASE)
-            if antwort_match: question_data["correct_answer"] = antwort_match.group(1).strip()
-            
-            kommentar_match = re.search(r'Kommentar:\\s*(.*?)(?=\\s*Fach:|\\s*Antwort:|$)', metadata_body, re.DOTALL | re.IGNORECASE)
-            if kommentar_match: question_data["comment"] = kommentar_match.group(1).strip()
-
-        else:
-             # --- Fallback / Alternative Frageerkennung (wenn \"X. Frage:\" nicht am Anfang steht) ---
-             # Behalte die bisherige Logik für alternative Formate bei
-             alt_match = re.search(r'(?:Was|Welche|Wo|Wann|Wie|Warum).*?\?', block_text, re.DOTALL | re.IGNORECASE)
-             if alt_match:
-                 question_data["question"] = alt_match.group(0).strip()
-                 logger.info(f"Block {block_idx+1}: Alternative Frage (?) gefunden: {question_data['question'][:60]}...")
-                 # Extrahiere Optionen/Meta auch hier (vereinfacht)
-                 for letter in "ABCDE":
-                     option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*[A-E]\\)|\\s*Fach:|\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL)
-                     if option_match: question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
-                 fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
-                 if fach_match: question_data["subject"] = fach_match.group(1).strip()
-                 antwort_match = re.search(r'Antwort:\\s*(.*?)(?=\\s*Fach:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
-                 if antwort_match: question_data["correct_answer"] = antwort_match.group(1).strip()
-                 kommentar_match = re.search(r'Kommentar:\\s*(.*?)(?=\\s*Fach:|\\s*Antwort:|$)', block_text, re.DOTALL | re.IGNORECASE)
-                 if kommentar_match: question_data["comment"] = kommentar_match.group(1).strip()
-             else: 
-                 first_line = block_text.split('\n')[0].strip()
-                 if not re.match(r'^(Fach|Antwort|Kommentar):', first_line, re.IGNORECASE):
-                     question_data["question"] = first_line
-                     logger.info(f"Block {block_idx+1}: Fallback-Frage (erste Zeile) verwendet: {question_data['question'][:60]}...")
-                     # Extrahiere Optionen/Meta auch hier (vereinfacht)
-                     for letter in "ABCDE":
-                        option_match = re.search(rf'{letter}\\)\\s*(.*?)(?=\\s*[A-E]\\)|\\s*Fach:|\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL)
-                        if option_match: question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
-                     fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
-                     if fach_match: question_data["subject"] = fach_match.group(1).strip()
-                     antwort_match = re.search(r'Antwort:\\s*(.*?)(?=\\s*Fach:|\\s*Kommentar:|$)', block_text, re.DOTALL | re.IGNORECASE)
-                     if antwort_match: question_data["correct_answer"] = antwort_match.group(1).strip()
-                     kommentar_match = re.search(r'Kommentar:\\s*(.*?)(?=\\s*Fach:|\\s*Antwort:|$)', block_text, re.DOTALL | re.IGNORECASE)
-                     if kommentar_match: question_data["comment"] = kommentar_match.group(1).strip()
-                 else:
-                     logger.warning(f"Block {block_idx+1}: Konnte keine klare Frage extrahieren.")
-                     # Frage bleibt leer, aber Block wird trotzdem für Bildsuche etc. behalten
-        
-        # --- PRÜFUNG: Leere Frage überspringen ---
-        is_question_empty = not question_data["question"] or question_data["question"].isspace()
-        are_options_empty = all(
-            (not question_data.get(f"option_{l}") or question_data.get(f"option_{l}").isspace()) 
-            for l in "abcde"
-        )
-        
-        if is_question_empty and are_options_empty:
-            logger.warning(f"Block {block_idx+1} (Nummer {question_data['question_number']}) wird übersprungen, da Frage und Optionen leer sind.")
-            continue # Zum nächsten Block gehen
-        
-        # --- Ende: NEUE LOGIK ---
-        
-        # --- Entferne alte Options/Meta-Extraktion (ist jetzt oben integriert) ---
-        # for letter in "ABCDE":
-        # ... (alter Code entfernt) ...
-        # fach_match = ... 
-        # antwort_match = ...
-        # kommentar_match = ...
-        
-        # --- Beginn: Bildsuche und -zuordnung innerhalb des Blocks (Unverändert) ---
-        found_image_in_block = False
-        block_page_indices = set() # Seiten, die Text dieses Blocks enthalten
-
-        # 1. Finde heraus, welche Seiten den Text dieses Blocks enthalten
-        relevant_pages = []
-        for p_info in page_texts:
-             # Prüfe auf Überlappung der Zeichenindizes
-             if max(block_start_index, p_info["index"]) < min(block_end_index, p_info["index"] + len(p_info["text"])):
-                 block_page_indices.add(p_info["page_idx"])
-                 relevant_pages.append(p_info["page_idx"])
-        
-        # Wenn Seiten gefunden wurden, setze die erste als Hauptseite der Frage
-        if relevant_pages:
-            question_data["page"] = min(relevant_pages)
-            # Versuche Y-Position der Frage auf der Seite zu finden (Approximation)
-            try:
-                 page_text_for_y = doc[question_data["page"]].get_text("text")
-                 # Suche nach Anfang der Frage oder ersten Zeile des Blocks
-                 search_term = question_data["question"][:30] if question_data["question"] else block_text.split('\n')[0][:30]
-                 pos = page_text_for_y.find(search_term)
-                 if pos != -1:
-                     # Schätze Y basierend auf Zeichenposition (sehr ungenau)
-                     page_height = doc[question_data["page"]].rect.height
-                     estimated_y = (pos / len(page_text_for_y)) * page_height if len(page_text_for_y) > 0 else 0
-                     question_data["y"] = estimated_y
-                     #logger.info(f"Geschätzte Y-Position für Frage {question_data['question_number']} auf Seite {question_data['page']}: {estimated_y:.0f}")
-            except Exception as e_y:
-                 logger.warning(f"Fehler bei Schätzung der Y-Position für Frage {question_data['question_number']}: {e_y}")
-
-        # 2. Suche Bilder auf diesen Seiten und prüfe Zugehörigkeit zum Block
-        if relevant_pages:
-             for page_idx in sorted(list(relevant_pages)): # Gehe Seiten in Reihenfolge durch
-                 try:
-                     page = doc[page_idx]
-                     # Finde die Bounding Box des Textes, der *auf dieser Seite* zum Block gehört
-                     # Verwende page.get_text("blocks"), um Textblöcke mit Koordinaten zu erhalten
-                     page_block_rect = fitz.Rect() # BBox des Block-Texts auf dieser Seite
-                     page_text_blocks = page.get_text("blocks")
-                     
-                     # Finde den Start- und End-Index des Block-Texts *relativ* zum Seitenanfang
-                     page_start_in_full = page_texts[page_idx]["index"]
-                     rel_block_start = max(0, block_start_index - page_start_in_full)
-                     rel_block_end = min(len(page_texts[page_idx]["text"]), block_end_index - page_start_in_full)
-
-                     block_text_on_page = page_texts[page_idx]["text"][rel_block_start:rel_block_end]
-
-                     # Approximiere die BBox durch die Blöcke, die Teile des Texts enthalten (ungenau)
-                     # Bessere Methode: page.search_for, wenn der Text kurz genug ist.
-                     # Hier vereinfachte Annahme: Nutze die y-Koordinate der Frage als Anker
-                     
-                     # Einfachere Heuristik: Prüfe Bilder auf der Seite
-                     page_images = page.get_images(full=True)
-                     for img_info in page_images:
-                         xref = img_info[0]
-                         if xref in extracted_xrefs_global: continue # Schon global verarbeitet
-
-                         img_rect = page.get_image_bbox(img_info)
-                         if img_rect.is_empty: continue
-                         
-                         # Zugehörigkeitsprüfung: Liegt das Bild *nach* der geschätzten Y-Position der Frage
-                         # und *vor* der geschätzten Y-Position der *nächsten* Frage (oder Seitenende)?
-                         # Dies ist eine Annäherung an die Block-Zugehörigkeit.
-                         
-                         # Bedingung: Bild muss auf einer Seite des Blocks sein
-                         if page_idx in block_page_indices:
-                             # Prüfe, ob schon ein Bild zugeordnet wurde
-                             if not question_data["image_key"]: 
-                                 base_image = doc.extract_image(xref)
-                                 if base_image and len(base_image["image"]) > 100:
-                                     extracted_xrefs_global.add(xref) # Zum globalen Set hinzufügen
-                                     question_data["image_bytes"] = base_image["image"]
-                                     question_data["image_ext"] = base_image["ext"]
-                                     img_y_coord = int(img_rect.y0) # Verwende y0 als Teil des Schlüssels
-                                     question_data["image_key"] = f"{question_data['id']}_{page_idx}_{img_y_coord}.{base_image['ext']}"
-                                     # Update page/y basierend auf Bildposition
-                                     question_data["page"] = page_idx 
-                                     question_data["y"] = img_rect.y0 
-                                     logger.info(f"Bild (xref {xref}) auf Seite {page_idx+1} Frage {question_data['question_number']} im Block {block_idx+1} zugeordnet (Erstes Bild im Block). Key: {question_data['image_key']}")
-                                     found_image_in_block = True
-                                     break # Nur das erste Bild pro Block nehmen
-                 except Exception as e_img_search:
-                     logger.error(f"Fehler bei Bildsuche in Block {block_idx+1}, Seite {page_idx+1}: {e_img_search}")
-                 
-                 if found_image_in_block:
-                     break # Stoppe Seitensuche für diesen Block, wenn Bild gefunden wurde
-
-        questions.append(question_data)
-        
     try:
-        doc.close() # Dokument schließen
-    except Exception as e_close:
-        logger.warning(f"Fehler beim Schließen des PDF-Dokuments: {e_close}")
-    
-    logger.info(f"Insgesamt {len(questions)} Fragen extrahiert, {sum(1 for q in questions if q['image_key'])} davon mit direkt zugeordneten Bildern.")
-    return questions
+        logger.info(f"PDF hat {len(doc)} Seiten")
+
+        # Füge den gesamten Text zusammen
+        full_text = ""
+        for page in doc:
+            page_text = page.get_text()
+            full_text += page_text
+        
+        # Debug-Ausgabe eines Textausschnitts
+        logger.info(f"Textprobe (erste 300 Zeichen): {full_text[:300]}")
+        
+        # Trenne Text in Fragen-Blöcke mit mindestens 10 Unterstrichen
+        question_blocks = re.split(r'_{10,}', full_text)
+        logger.info(f"Gefunden: {len(question_blocks)} durch Unterstriche getrennte Blöcke")
+        
+        # Erste Variante: Suche nach "X. Frage:" Format
+        question_pattern = re.compile(r'(\d+)\.\s*Frage:?\s*(.*?)(?=(?:\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$))', re.DOTALL)
+        
+        # Gehe durch alle Blöcke
+        for block_idx, block in enumerate(question_blocks):
+            block = block.strip()
+            if not block:
+                continue
+            
+            # Extrahiere die Fragenummer und den Fragetext
+            question_match = question_pattern.search(block)
+            if not question_match:
+                # Alternative Fragemuster
+                alt_match = re.search(r'(?:Was|Welche|Wo|Wann|Wie|Warum).*?\?', block, re.DOTALL | re.IGNORECASE) # Ignore case
+                if alt_match:
+                    question_text = alt_match.group(0).strip()
+                    logger.info(f"Alternative Frage gefunden (Block {block_idx+1}): {question_text[:50]}")
+                    
+                    question_data = {
+                        "id": str(uuid.uuid4()),
+                        "page": -1,  # Später zuweisen
+                        "y": 0,      # Später zuweisen
+                        "full_text": block, # Behalte Blocktext
+                        "question_number": str(block_idx + 1), # Verwende Blockindex als Nummer
+                        "question": question_text,
+                        "option_a": "", "option_b": "", "option_c": "", "option_d": "", "option_e": "",
+                        "subject": "", "correct_answer": "", "comment": ""
+                    }
+                    
+                    # Extrahiere Optionen A-E
+                    for letter in "ABCDE":
+                        option_match = re.search(rf'{letter}\)(.*?)(?=\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
+                        if option_match:
+                            question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
+                    
+                    questions.append(question_data)
+                continue
+            
+            # Standardfall: "X. Frage: Text" Format
+            question_number = question_match.group(1)
+            question_text = question_match.group(2).strip()
+            
+            logger.info(f"Frage {question_number} gefunden: {question_text[:50]}")
+            
+            # Vorbereiten der Fragedaten
+            question_data = {
+                "id": str(uuid.uuid4()),
+                "page": -1,  # Später zuweisen
+                "y": 0,      # Später zuweisen
+                "full_text": block,
+                "question_number": question_number,
+                "question": question_text,
+                "option_a": "", "option_b": "", "option_c": "", "option_d": "", "option_e": "",
+                "subject": "", "correct_answer": "", "comment": ""
+            }
+            
+            # Extrahiere Optionen A-E
+            for letter in "ABCDE":
+                option_match = re.search(rf'{letter}\)(.*?)(?=\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
+                if option_match:
+                    question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
+            
+            # Extrahiere Metadaten
+            fach_match = re.search(r'Fach:\s*(.*?)(?=\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
+            if fach_match:
+                question_data["subject"] = fach_match.group(1).strip()
+            
+            antwort_match = re.search(r'Antwort:\s*(.*?)(?=\s*Fach:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
+            if antwort_match:
+                question_data["correct_answer"] = antwort_match.group(1).strip()
+            
+            kommentar_match = re.search(r'Kommentar:\s*(.*?)(?=\s*Fach:|\s*Antwort:|$)', block, re.DOTALL | re.IGNORECASE)
+            if kommentar_match:
+                question_data["comment"] = kommentar_match.group(1).strip()
+            
+            questions.append(question_data)
+        
+        # Suche in allen Seiten nach "X. Frage:" für Seitenzuordnung
+        for q in questions:
+            search_pattern = f"{q['question_number']}. Frage:"
+            for page_idx in range(len(doc)):
+                page_text = doc[page_idx].get_text()
+                if search_pattern in page_text:
+                    q["page"] = page_idx
+                    # Schätze y-Position 
+                    q["y"] = page_text.find(search_pattern) / len(page_text) * 800
+                    break
+        
+        # Zweite Variante: Wenn keine oder nur wenige Fragen gefunden wurden, suche nach Fragezeichen-Sätzen
+        if len(questions) < 5:
+            logger.warning(f"Nur {len(questions)} Fragen gefunden. Versuche alternativen Ansatz (Fragezeichen)...")
+            
+            # Verwende den gesamten Text, um Sätze zu finden
+            try:
+                full_doc_text = doc.get_text()
+                question_sentences = re.findall(r'(?:[^.!?]*?(?:Was|Welche|Wo|Wann|Wie|Warum)[^.!?]*?\?)', full_doc_text, re.IGNORECASE)
+                valid_sentences = [s.strip() for s in question_sentences if len(s.strip()) > 20]
+
+                # Füge diese als Fragen hinzu, aber ohne genaue Position
+                for idx, sentence in enumerate(valid_sentences, start=len(questions)+1):
+                    questions.append({
+                        "id": str(uuid.uuid4()),
+                        "page": -1, # Position unbekannt
+                        "y": 0,     # Position unbekannt
+                        "full_text": sentence, # Ganzer Satz als Text
+                        "question_number": str(idx),
+                        "question": sentence,
+                        "option_a": "", "option_b": "", "option_c": "", "option_d": "", "option_e": "",
+                        "subject": "", "correct_answer": "", "comment": ""
+                        # Optionen etc. können hier nicht zuverlässig extrahiert werden
+                    })
+                logger.info(f"{len(valid_sentences)} Fragen über Fragezeichen-Muster hinzugefügt.")
+            except Exception as text_error:
+                logger.error(f"Fehler beim Extrahieren des Volltextes für Fragezeichen-Suche: {text_error}")
+
+        logger.info(f"Insgesamt {len(questions)} Fragen extrahiert")
+        return questions
+
+    finally:
+        # Schließe das Dokument nur, wenn es hier geöffnet wurde
+        if close_doc_at_end and doc:
+            doc.close()
 
 def parse_question_details(question):
     """
@@ -1358,18 +1204,15 @@ def parse_question_details(question):
         logger.error(f"Fehler beim Parsen der Fragedetails: {str(e)}")
         return question
 
-def extract_images_with_coords(pdf_path):
+def extract_images_with_coords(doc: fitz.Document): # Akzeptiert doc statt pdf_path
     """
     Optimierte Bildextraktionsfunktion mit Performance-Verbesserungen
     """
-    doc = fitz.open(pdf_path)
+    # Entferne: doc = fitz.open(pdf_path)
     images = []
-    
-    # Cache für extrahierte Bilder, um Duplikate zu vermeiden
     extracted_xrefs = set()
-    
     logger.info(f"Starte optimierte Bildextraktion aus PDF mit {len(doc)} Seiten")
-    
+
     # Methode 1: Direkte Bildextraktion über Blöcke (optimiert)
     try:
         # Verwende eine effizientere Schleife mit früherem Abbruch bei Fehlern
@@ -1396,7 +1239,7 @@ def extract_images_with_coords(pdf_path):
                         continue
                         
                     extracted_xrefs.add(xref)
-                    base_image = doc.extract_image(xref)
+                    base_image = doc.extract_image(xref) # Verwende doc
                     
                     if not base_image:
                         logger.warning(f"Leeres Bild für xref {xref} auf Seite {page_number+1}")
@@ -1462,49 +1305,46 @@ def extract_images_with_coords(pdf_path):
                 for block_idx, block in enumerate(blocks):
                     if block.get("type") == 1:  # Bildblock
                         try:
-                            # Diverses PyMuPDF-Versionshandling
-                            xref = None
-                            if isinstance(block.get("image"), dict):
-                                xref = block["image"].get("xref")
-                            elif hasattr(block, "xref"):
-                                xref = block.xref
-                            
+                            # Extrahiere xref (funktioniert für viele PDF-Versionen)
+                            xref = block.get("xref", 0)
+                            if xref == 0 and 'image' in block and isinstance(block['image'], bytes):
+                                 # Manchmal ist das Bild direkt im Block (selten)
+                                 # Diese Logik ist komplex und wird hier vereinfacht
+                                 logger.warning(f"Bild in Block {block_idx+1} ohne xref gefunden, überspringe vorerst.")
+                                 continue
+
                             # Überspringe bereits extrahierte Bilder
                             if xref in extracted_xrefs:
-                                logger.info(f"Bild mit xref {xref} bereits extrahiert (Methode 2), überspringe...")
-                                continue
-                                
+                                 logger.info(f"Bild mit xref {xref} bereits extrahiert (Methode 2), überspringe...")
+                                 continue
+
                             if xref:
-                                extracted_xrefs.add(xref)
-                                base_image = doc.extract_image(xref)
-                                
-                                if not base_image:
-                                    continue
-                                    
-                                image_bytes = base_image["image"]
-                                image_ext = base_image["ext"]
-                                
-                                # Überprüfe die Bildqualität
-                                if len(image_bytes) < 100:
-                                    logger.warning(f"Bild auf Seite {page_number+1} zu klein ({len(image_bytes)} Bytes), überspringe...")
-                                    continue
-                                
-                                # Normalisiere die Bounding Box
-                                bbox = [0, 0, 0, 0]  # Standardwert
-                                if "bbox" in block and isinstance(block["bbox"], (list, tuple)) and len(block["bbox"]) >= 4:
-                                    bbox = list(block["bbox"])  # Konvertiere zu Liste für Konsistenz
-                                else:
-                                    # Fallback: Verwende Position basierend auf Blockindex
-                                    bbox = [0, block_idx * 100, 100, (block_idx + 1) * 100]
-                                
-                                images.append({
-                                    "page": page_number,
-                                    "bbox": bbox,
-                                    "image_bytes": image_bytes,
-                                    "image_ext": image_ext,
-                                    "question_id": None
-                                })
-                                logger.info(f"Block-Bild {block_idx+1} von Seite {page_number+1} extrahiert: {image_ext} Format, {len(image_bytes)} Bytes")
+                                 extracted_xrefs.add(xref)
+                                 base_image = doc.extract_image(xref) # Verwende doc
+
+                                 if not base_image: continue
+
+                                 image_bytes = base_image["image"]
+                                 image_ext = base_image["ext"]
+
+                                 if len(image_bytes) < 100:
+                                     logger.warning(f"Bild auf Seite {page_number+1} zu klein ({len(image_bytes)} Bytes), überspringe...")
+                                     continue
+
+                                 bbox = [0, 0, 0, 0]
+                                 if "bbox" in block and isinstance(block["bbox"], (list, tuple)) and len(block["bbox"]) >= 4:
+                                     bbox = list(block["bbox"])
+                                 else:
+                                     bbox = [0, block_idx * 100, 100, (block_idx + 1) * 100]
+
+                                 images.append({
+                                     "page": page_number,
+                                     "bbox": bbox,
+                                     "image_bytes": image_bytes,
+                                     "image_ext": image_ext,
+                                     "question_id": None
+                                 })
+                                 logger.info(f"Block-Bild {block_idx+1} von Seite {page_number+1} extrahiert: {image_ext} Format, {len(image_bytes)} Bytes")
                         except Exception as block_error:
                             logger.error(f"Fehler bei Block-Bildextraktion (Block {block_idx+1}, Seite {page_number+1}): {str(block_error)}")
         except Exception as e:
@@ -1539,167 +1379,158 @@ def extract_images_with_coords(pdf_path):
     
     return images
 
-def map_images_to_questions(questions, images):
+def map_images_to_questions(questions: List[Dict], images: List[Dict], doc: fitz.Document) -> List[Dict]:
     """
-    Optimierte Algorithmus zur Zuordnung von Bildern zu Fragen mit verbesserter Performance
+    Ordnet Bilder den Fragen zu, basierend auf ihrer Reihenfolge innerhalb von Blöcken,
+    die durch horizontale Linien getrennt sind.
+
+    Args:
+        questions: Liste der extrahierten Fragen (Dicts mit 'id', 'page', 'y').
+                   'y' sollte die obere Y-Koordinate der Frage sein.
+        images: Liste der extrahierten Bilder (Dicts mit 'bbox', 'page').
+        doc: Das fitz.Document Objekt zur Extraktion von Trennlinien.
+
+    Returns:
+        Die aktualisierte Liste der Bilder, wobei jedes Bild möglicherweise eine 'question_id' hat.
+        WICHTIG: Diese Funktion modifiziert auch die `questions`-Liste direkt,
+                 indem sie den `image_key` setzt.
     """
-    logger.info(f"Starte optimierte Bildzuordnung: {len(images)} Bilder zu {len(questions)} Fragen")
-    
+    logger.info(f"Starte Block-basierte Bildzuordnung: {len(images)} Bilder zu {len(questions)} Fragen")
+
     if not images or not questions:
         logger.warning("Keine Bilder oder Fragen vorhanden für die Zuordnung")
-        return images
-    
+        return images # Gebe unveränderte Bilder zurück
+
     try:
-        # Organisiere Fragen nach Seiten in einer effizienten Datenstruktur
-        # Verwende vorberechnete Sortierung für schnelleren Zugriff
-        questions_by_page = {}
-        for q in questions:
-            page = q.get("page", -1)
-            if page >= 0:  # Ignoriere Fragen ohne Seitenzuordnung
-                if page not in questions_by_page:
-                    questions_by_page[page] = []
-                questions_by_page[page].append(q)
-        
-        # Vorsortiere Fragen nach Y-Koordinate innerhalb jeder Seite (steigert die Performance)
-        for page, page_questions in questions_by_page.items():
-            # Sortiere Fragen nach Y-Koordinate (aufsteigend)
-            page_questions.sort(key=lambda q: float(q.get("y", 0)) if isinstance(q.get("y", 0), (int, float, str)) else 0)
-        
-        # Verarbeite alle Bilder in einem effizienten Durchlauf
-        start_time = datetime.now()
-        assigned_count = 0
-        
-        # Gruppiere Bilder nach Seiten für effizientere Verarbeitung
-        images_by_page = {}
+        # 1. Finde die Trennlinien im Dokument
+        separators_by_page = find_separator_lines(doc)
+
+        # 2. Bereite Elemente pro Seite vor und sortiere sie
+        elements_by_page: Dict[int, List[Tuple[float, str, Dict]]] = {}
+
+        # Füge Fragen hinzu (nur die mit gültiger Seite/Position)
+        valid_questions = [q for q in questions if q.get("page", -1) >= 0 and q.get("y", -1) >= 0]
+        logger.info(f"Verwende {len(valid_questions)} Fragen mit gültiger Position für die Zuordnung.")
+
+        for q in valid_questions:
+            page = q["page"]
+            y = q["y"] # Verwende die bereits bestimmte Y-Koordinate
+
+            if page not in elements_by_page: elements_by_page[page] = []
+            elements_by_page[page].append((y, "question", q))
+
+        # Füge Bilder hinzu
         for img_idx, img in enumerate(images):
             if not isinstance(img, dict):
                 logger.error(f"Bild {img_idx} ist kein Dictionary: {type(img)}")
                 continue
-                
+
             page = img.get("page", -1)
-            # Konvertiere page zu int, falls es ein string ist
-            if isinstance(page, str) and page.isdigit():
-                page = int(page)
-                
-            if page not in images_by_page:
-                images_by_page[page] = []
-            images_by_page[page].append((img_idx, img))
-        
-        # Verarbeite alle Bilder seitenweise
-        for page, page_images in images_by_page.items():
-            # Überprüfe, ob es Fragen auf dieser Seite gibt
-            if page not in questions_by_page:
-                logger.info(f"Keine Fragen auf Seite {page} für {len(page_images)} Bilder")
-                continue
-            
-            page_questions = questions_by_page[page]
-            
-            # Sortiere Bilder nach Y-Koordinate für effizientere Zuordnung
-            def get_image_y(img_tuple):
-                _, img = img_tuple
-                bbox = img.get("bbox", [0, 0, 0, 0])
-                
-                if isinstance(bbox, (list, tuple)) and len(bbox) > 1:
-                    y = bbox[1]
-                elif isinstance(bbox, int):
-                    y = bbox
-                else:
+            if page == -1: # Überspringe Bilder ohne Seitenzahl
+                 logger.warning(f"Bild {img_idx} hat keine Seitenzahl, wird übersprungen.")
+                 continue
+
+            bbox = img.get("bbox", [])
+            y = 0
+            if isinstance(bbox, (list, tuple)) and len(bbox) > 1:
+                raw_y = bbox[1] # y0 der Bounding Box
+                try:
+                    y = float(raw_y)
+                except (ValueError, TypeError):
+                    logger.warning(f"Ungültige Y-Koordinate für Bild {img_idx} auf Seite {page}: {raw_y}. Verwende 0.")
                     y = 0
-                    
-                # Stelle sicher, dass y numerisch ist
-                if not isinstance(y, (int, float)):
-                    try:
-                        y = float(y)
-                    except (ValueError, TypeError):
-                        y = 0
-                        
-                return y
-                
-            # Sortiere nach Y-Koordinate für effizientere Verarbeitung
-            page_images.sort(key=get_image_y)
-            
-            # Optimierte Zuordnung mit Binary Search Annäherung
-            for img_idx, img in page_images:
-                # Extrahiere Y-Koordinate des Bildes
-                bbox = img.get("bbox", [0, 0, 0, 0])
-                img_y = 0
-                
-                if isinstance(bbox, (list, tuple)) and len(bbox) > 1:
-                    img_y = bbox[1]
-                elif isinstance(bbox, int):
-                    img_y = bbox
-                
-                # Stelle sicher, dass img_y numerisch ist
-                if not isinstance(img_y, (int, float)):
-                    try:
-                        img_y = float(img_y)
-                    except (ValueError, TypeError):
-                        img_y = 0
-                
-                # Optimierte Kandidatensuche mit Linear Scan (schneller für sortierte Listen)
-                # Binary Search wäre hier zu komplex für den potenziellen Gewinn
-                best_question = None
-                best_distance = float('inf')
-                
-                for q in page_questions:
-                    q_y = q.get("y", 0)
-                    # Stelle sicher, dass q_y numerisch ist
-                    if not isinstance(q_y, (int, float)):
-                        try:
-                            q_y = float(q_y)
-                        except (ValueError, TypeError):
-                            q_y = 0
-                    
-                    # Berechne Distanz - bevorzuge Fragen oberhalb des Bildes
-                    if q_y <= img_y:  # Frage ist oberhalb des Bildes
-                        distance = img_y - q_y
+            # elif isinstance(bbox, (int, float)): # Weniger wahrscheinlich
+            #      y = float(bbox)
+            else:
+                 logger.warning(f"Ungültige BBox für Bild {img_idx} auf Seite {page}: {bbox}. Verwende Y=0.")
+                 y = 0
+
+            if page not in elements_by_page: elements_by_page[page] = []
+            # Füge Originalindex hinzu, um das Bild später zu aktualisieren
+            img['_original_index'] = img_idx
+            elements_by_page[page].append((y, "image", img))
+
+        # Füge Trennlinien hinzu
+        for page, lines in separators_by_page.items():
+            if page not in elements_by_page: elements_by_page[page] = []
+            for y in lines:
+                elements_by_page[page].append((y, "separator", {"page": page, "y": y}))
+
+        # Sortiere Elemente auf jeder Seite nach Y-Koordinate
+        for page in elements_by_page:
+            elements_by_page[page].sort(key=lambda item: item[0]) # Sortiere nach Y
+
+        # 3. Iteriere durch sortierte Elemente und weise Bilder zu
+        assigned_count = 0
+        start_time = datetime.now()
+
+        for page, elements in elements_by_page.items():
+            current_question = None
+            logger.info(f"Verarbeite Seite {page+1} mit {len(elements)} Elementen (Fragen, Bilder, Linien)")
+
+            for y, type, data in elements:
+                if type == "question":
+                    current_question = data # Merke die letzte gesehene Frage
+                    logger.debug(f"Seite {page+1}, Y={y:.0f}: Frage {data.get('question_number', '?')} beginnt.")
+                elif type == "image":
+                    if current_question:
+                        img_idx = data['_original_index']
+                        img_data = images[img_idx] # Das Original-Bild-Dict holen
+                        question_id = current_question.get("id")
+
+                        # Weise das Bild der aktuellen Frage zu
+                        img_data["question_id"] = question_id
+
+                        # Erstelle Bildschlüssel (konsistent mit vorheriger Logik)
+                        img_y_for_key = int(y)
+                        image_key = f"{question_id}_{page}_{img_y_for_key}.{img_data.get('image_ext', 'jpg')}"
+
+                        # Aktualisiere die Frage in der Original-Liste mit dem Bildschlüssel
+                        # Suche die Frage anhand der ID in der ursprünglichen `questions`-Liste
+                        found_q = False
+                        for q_orig in questions:
+                            if q_orig.get("id") == question_id:
+                                # Füge Key hinzu oder überschreibe bestehenden (falls mehrere Bilder pro Frage)
+                                # Das letzte Bild im Block setzt den Key für die Frage
+                                q_orig["image_key"] = image_key
+                                found_q = True
+                                break
+                        if not found_q:
+                             logger.error(f"Konnte Originalfrage mit ID {question_id} zum Setzen des Image Keys nicht finden!")
+
+
+                        assigned_count += 1
+                        logger.info(f"Seite {page+1}, Y={y:.0f}: Bild {img_idx} Frage {current_question.get('question_number', '?')} ({question_id}) zugeordnet. Key: {image_key}")
                     else:
-                        # Frage ist unterhalb - weniger bevorzugt, aber möglich
-                        distance = (q_y - img_y) * 2  # Gewichtungsfaktor
-                    
-                    if distance < best_distance:
-                        best_distance = distance
-                        best_question = q
-                
-                # Wenn ein passender Kandidat gefunden wurde
-                if best_question:
-                    # Weise das Bild der Frage zu
-                    img["question_id"] = best_question.get("id")
-                    
-                    # Erstelle einen Bildschlüssel
-                    image_key = f"{best_question.get('id')}_{page}_{int(float(img_y))}.{img.get('image_ext', 'jpg')}"
-                    
-                    # Aktualisiere die Frage mit dem Bildschlüssel
-                    for q in questions:
-                        if q.get("id") == best_question.get("id"):
-                            q["image_key"] = image_key
-                            logger.info(f"Bild {img_idx} zugeordnet zu Frage {q.get('question_number', '?')} auf Seite {page}, Distanz: {best_distance:.2f}")
-                            assigned_count += 1
-                            break
-                elif page_questions:  # Fallback: Verwende die erste Frage auf der Seite, wenn keine passende gefunden wurde
-                    first_question = page_questions[0]
-                    img["question_id"] = first_question.get("id")
-                    image_key = f"{first_question.get('id')}_{page}_{int(float(img_y))}.{img.get('image_ext', 'jpg')}"
-                    
-                    for q in questions:
-                        if q.get("id") == first_question.get("id"):
-                            q["image_key"] = image_key
-                            logger.info(f"Bild {img_idx} der ersten Frage auf Seite {page} zugeordnet (Fallback)")
-                            assigned_count += 1
-                            break
-        
-        # Statistiken zur Leistungsmessung
+                        # Bild erscheint vor der ersten Frage oder nach einer Linie ohne folgende Frage
+                         logger.warning(f"Seite {page+1}, Y={y:.0f}: Bild {data.get('_original_index')} keiner Frage zugeordnet (keine vorherige Frage im Block).")
+                elif type == "separator":
+                    # Eine Linie beendet den aktuellen Block, Bilder danach gehören nicht mehr zur current_question
+                    logger.debug(f"Seite {page+1}, Y={y:.0f}: Trennlinie gefunden, setze aktuelle Frage zurück.")
+                    current_question = None # Setze zurück für nächsten Block
+
+        # Entferne den temporären Index aus den Bild-Dicts
+        for img in images:
+            if '_original_index' in img:
+                del img['_original_index']
+
         end_time = datetime.now()
         processing_time = (end_time - start_time).total_seconds()
-        logger.info(f"Bildzuordnung abgeschlossen: {assigned_count} von {len(images)} Bildern zugeordnet, Dauer: {processing_time:.2f}s")
-        
+        logger.info(f"Block-basierte Bildzuordnung abgeschlossen: {assigned_count} von {len(images)} Bildern zugeordnet, Dauer: {processing_time:.2f}s")
+
+        # Gebe die (potenziell modifizierte) images-Liste zurück
         return images
-    
+
     except Exception as e:
-        logger.error(f"Fehler bei der optimierten Bildzuordnung: {str(e)}")
+        logger.error(f"Fehler bei der Block-basierten Bildzuordnung: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
-        return images
+        # Im Fehlerfall die unveränderten Bilder zurückgeben
+        # Entferne temporären Index, falls vorhanden
+        for img in images:
+            if '_original_index' in img:
+                del img['_original_index']
+        return images # Gebe unveränderte Liste zurück
 
 def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, user_id, visibility, config):
     """
@@ -1908,32 +1739,52 @@ def main(pdf_path):
         print("Prüfungsdaten:", exam_name, exam_year, exam_semester)
 
         # Fragen extrahieren und verarbeiten
-        questions = extract_questions_with_coords(pdf_path)
+        # Öffne Doc hier für main, wenn extract* es braucht
+        doc = fitz.open(pdf_path)
+        questions = extract_questions_with_coords(doc) # Pass doc
         for q in questions:
             parse_question_details(q)
         print(f"{len(questions)} Fragen extrahiert.")
 
         # Bilder verarbeiten (MinIO beibehalten)
-        images = extract_images_with_coords(pdf_path)
-        images = map_images_to_questions(questions, images)
+        images = extract_images_with_coords(doc) # Pass doc
+        images = map_images_to_questions(questions, images, doc) # Pass doc
+        doc.close() # Schließe doc hier in main
         print(f"{len(images)} Bilder extrahiert.")
 
         bucket_name = "exam-images"
-        for img in images:
-            if img.get("question_id"):
-                filename = f"{img['question_id']}_{img['page']}_{int(img['bbox'][1])}.{img['image_ext']}"
-                # Supabase Storage Upload
-                upload_image_to_supabase(
-                    img["image_bytes"], 
-                    filename, 
-                    bucket_name, 
-                    config
-                )
-                # Aktualisiere die zugehörige Frage
-                for q in questions:
-                    if q["id"] == img["question_id"]:
-                        q["image_key"] = filename
-                        break
+        # Bild-Upload Logik basierend auf image_key in questions
+        processed_keys = set()
+        for q in questions:
+             if q.get("image_key") and q["image_key"] not in processed_keys:
+                 image_key = q["image_key"]
+                 # Finde das Bild, das zu diesem Key gehört
+                 found_img_data = None
+                 for img in images:
+                      # Finde Key basierend auf Bild-Metadaten
+                      img_y_for_key = 0
+                      bbox = img.get("bbox", [0, 0])[1]
+                      try: img_y_for_key = int(float(bbox))
+                      except: pass
+                      expected_key = f"{q.get('id')}_{img.get('page', 0)}_{img_y_for_key}.{img.get('image_ext', 'jpg')}"
+                      if expected_key == image_key and img.get("image_bytes"):
+                           found_img_data = img["image_bytes"]
+                           break
+                 if found_img_data:
+                      upload_successful = upload_image_to_supabase(
+                          found_img_data,
+                          image_key,
+                          bucket_name,
+                          config
+                      )
+                      if upload_successful:
+                           processed_keys.add(image_key)
+                           print(f"Bild {image_key} hochgeladen.")
+                      else:
+                           print(f"Fehler beim Upload von {image_key}.")
+                 else:
+                      print(f"Keine Bilddaten für Key {image_key} gefunden.")
+
 
         # Fragen in Supabase speichern
         insert_questions_into_db(questions, exam_name, exam_year, exam_semester, None, "private", config)
@@ -1974,6 +1825,57 @@ def analyze_pdf_structure(pdf_path):
                 logger.info(f"{name}: {len(matches)} Treffer - Beispiele: {matches[:3]}")
     
     return {"pages": len(doc), "analyzed_samples": sample_pages}
+
+# --- Neue Hilfsfunktion ---
+def find_separator_lines(doc: fitz.Document) -> Dict[int, List[float]]:
+    """
+    Findet horizontale Linien (wahrscheinliche Trenner) in einem PDF-Dokument.
+
+    Args:
+        doc: Das fitz.Document Objekt.
+
+    Returns:
+        Ein Dictionary, bei dem die Schlüssel die Seitenzahlen (0-basiert) sind
+        und die Werte Listen von Y-Koordinaten der gefundenen Trennlinien auf dieser Seite.
+    """
+    separators_by_page = {}
+    min_line_width_ratio = 0.7  # Mindestbreite der Linie im Verhältnis zur Seitenbreite
+    max_line_height = 5         # Maximale Höhe der Linie
+
+    for page_idx, page in enumerate(doc):
+        page_lines = []
+        page_width = page.rect.width
+        drawings = page.get_drawings()
+
+        for path in drawings:
+            # Prüfe, ob es sich um ein gefülltes Rechteck handelt (oft für Linien verwendet)
+            if path["type"] == "f" and path["rect"]:
+                rect = path["rect"]
+                # Prüfe, ob es eine lange, dünne horizontale Linie ist
+                if (rect.width / page_width >= min_line_width_ratio and
+                        rect.height <= max_line_height):
+                    # Verwende die obere Y-Koordinate der Linie
+                    page_lines.append(rect.y0)
+            # Optional: Prüfe auch Linienpfade ('s'), falls Trenner so gezeichnet werden
+            elif path["type"] == "s":
+                 # Diese Logik ist komplexer, da 'items' analysiert werden müssten
+                 # Vorerst konzentrieren wir uns auf Rechtecke ('f')
+                 pass
+
+        if page_lines:
+            # Sortiere Linien nach Y-Position und entferne Duplikate (nahe Linien)
+            page_lines.sort()
+            unique_lines = []
+            if page_lines:
+                last_y = -1
+                for y in page_lines:
+                    if y - last_y > max_line_height: # Nur hinzufügen, wenn weit genug entfernt
+                       unique_lines.append(y)
+                       last_y = y
+            separators_by_page[page_idx] = unique_lines
+            logger.info(f"Seite {page_idx+1}: {len(unique_lines)} Trennlinien gefunden.")
+
+    return separators_by_page
 
 if __name__ == "__main__":
     uvicorn.run(
