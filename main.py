@@ -1161,9 +1161,9 @@ def extract_questions_with_coords(pdf_path):
             if kommentar_match: question_data["comment"] = kommentar_match.group(1).strip()
 
         else:
-             # --- Fallback / Alternative Frageerkennung (wenn "X. Frage:" nicht am Anfang steht) ---
+             # --- Fallback / Alternative Frageerkennung (wenn \"X. Frage:\" nicht am Anfang steht) ---
              # Behalte die bisherige Logik für alternative Formate bei
-             alt_match = re.search(r'(?:Was|Welche|Wo|Wann|Wie|Warum).*?\\?', block_text, re.DOTALL | re.IGNORECASE)
+             alt_match = re.search(r'(?:Was|Welche|Wo|Wann|Wie|Warum).*?\?', block_text, re.DOTALL | re.IGNORECASE)
              if alt_match:
                  question_data["question"] = alt_match.group(0).strip()
                  logger.info(f"Block {block_idx+1}: Alternative Frage (?) gefunden: {question_data['question'][:60]}...")
