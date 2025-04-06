@@ -1144,7 +1144,9 @@ def extract_questions_with_coords(pdf_path):
                          question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
 
             question_data["question"] = question_text_final
-            logger.info(f"Block {block_idx+1}: Frage {question_data['question_number']} erkannt. Body bis Optionen: '{question_text_final[:80].replace('\n',' ')}...' Optionen gefunden: {bool(options_text)}")
+            # Bereite Vorschau für Log vor (ersetze Newlines außerhalb des f-strings)
+            question_body_preview = question_text_final[:80].replace('\n', ' ')
+            logger.info(f"Block {block_idx+1}: Frage {question_data['question_number']} erkannt. Body bis Optionen: '{question_body_preview}...' Optionen gefunden: {bool(options_text)}")
 
             # 4. Extrahiere Metadaten aus metadata_body
             fach_match = re.search(r'Fach:\\s*(.*?)(?=\\s*Antwort:|\\s*Kommentar:|$)', metadata_body, re.DOTALL | re.IGNORECASE)
