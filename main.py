@@ -1535,6 +1535,29 @@ def map_images_to_questions(questions: List[Dict], images: List[Dict], doc: fitz
             question_id = best_q["id"]
             img["question_id"] = question_id
             
+            # QUICK FIX: Assign image to the question one number lower than determined
+            # This compensates for the systematic offset where images are assigned one question too high
+            original_question_number = best_q.get('question_number', '0')
+            try:
+                target_question_number = str(int(original_question_number) - 1)
+                # Find the question with the target number on the same page
+                target_question = None
+                for q in candidate_questions_for_img:
+                    if q.get('question_number') == target_question_number:
+                        target_question = q
+                        break
+                
+                if target_question:
+                    # Reassign to the target question (one number lower)
+                    question_id = target_question["id"]
+                    img["question_id"] = question_id
+                    best_q = target_question  # Update best_q for logging and key generation
+                    logger.info(f"QUICK FIX: Reassigned image {img_idx} from question {original_question_number} to question {target_question_number}")
+                else:
+                    logger.warning(f"QUICK FIX: Could not find target question {target_question_number} on page {img_page}, keeping original assignment to question {original_question_number}")
+            except (ValueError, TypeError):
+                logger.warning(f"QUICK FIX: Could not parse question number '{original_question_number}' as integer, keeping original assignment")
+            
             # Key construction uses image's midpoint Y, as before
             img_ext = img.get("image_ext", "jpg")
             key_y_component = int(img_mid_y) 
