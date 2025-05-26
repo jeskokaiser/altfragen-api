@@ -1412,156 +1412,47 @@ def extract_images_with_coords(doc: fitz.Document): # Akzeptiert doc statt pdf_p
 
 def map_images_to_questions(questions: List[Dict], images: List[Dict], doc: fitz.Document) -> List[Dict]:
     """
-    Ordnet Bilder den Fragen zu, basierend auf ihrer Reihenfolge innerhalb von Blöcken,
-    die durch horizontale Linien getrennt sind.
-
-    Args:
-        questions: Liste der extrahierten Fragen (Dicts mit 'id', 'page', 'y').
-                   'y' sollte die obere Y-Koordinate der Frage sein.
-        images: Liste der extrahierten Bilder (Dicts mit 'bbox', 'page').
-        doc: Das fitz.Document Objekt zur Extraktion von Trennlinien.
-
-    Returns:
-        Die aktualisierte Liste der Bilder, wobei jedes Bild möglicherweise eine 'question_id' hat.
-        WICHTIG: Diese Funktion modifiziert auch die `questions`-Liste direkt,
-                 indem sie den `image_key` setzt.
+    Updated implementation: assign each image to the nearest question on the same page based on vertical distance, ignoring separators.
     """
-    logger.info(f"Starte Block-basierte Bildzuordnung: {len(images)} Bilder zu {len(questions)} Fragen")
+    # Build mapping of questions by page with valid top and bottom positions
+    questions_by_page: Dict[int, List[Dict]] = {}
+    for q in questions:
+        page = q.get("page", -1)
+        y0 = q.get("y")
+        y1 = q.get("y1")
+        if page < 0 or y0 is None or y1 is None:
+            continue
+        questions_by_page.setdefault(page, []).append(q)
 
-    if not images or not questions:
-        logger.warning("Keine Bilder oder Fragen vorhanden für die Zuordnung")
-        return images # Gebe unveränderte Bilder zurück
+    # Assign each image
+    for img in images:
+        page = img.get("page", -1)
+        bbox = img.get("bbox", [])
+        # Skip images without page or bbox
+        if page not in questions_by_page or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        # Compute vertical midpoint of the image
+        mid_y = (bbox[1] + bbox[3]) / 2
+        # Try to find a question whose region contains this midpoint
+        assigned_q = None
+        for q in questions_by_page[page]:
+            if q["y"] <= mid_y <= q.get("y1", q["y"]):
+                assigned_q = q
+                break
+        # Fallback: nearest question by top y-distance
+        if not assigned_q:
+            assigned_q = min(questions_by_page[page], key=lambda q: abs(mid_y - q["y"]))
 
-    try:
-        # 1. Finde die Trennlinien im Dokument
-        separators_by_page = find_separator_lines(doc)
+        # Assign image to this question
+        question_id = assigned_q["id"]
+        img["question_id"] = question_id
+        # Construct image key
+        ext = img.get("image_ext", "jpg")
+        key_y = int(mid_y)
+        image_key = f"{question_id}_{page}_{key_y}.{ext}"
+        assigned_q["image_key"] = image_key
 
-        # 2. Bereite Elemente pro Seite vor und sortiere sie
-        elements_by_page: Dict[int, List[Tuple[float, str, Dict]]] = {}
-
-        # Füge Fragen hinzu (nur die mit gültiger Seite/Position)
-        valid_questions = [q for q in questions if q.get("page", -1) >= 0 and q.get("y", -1) >= 0]
-        logger.info(f"Verwende {len(valid_questions)} Fragen mit gültiger Position für die Zuordnung.")
-
-        for q in valid_questions:
-            page = q["page"]
-            y = q["y"] # Verwende die bereits bestimmte Y-Koordinate
-
-            if page not in elements_by_page: elements_by_page[page] = []
-            elements_by_page[page].append((y, "question", q))
-
-        # Füge Bilder hinzu
-        for img_idx, img in enumerate(images):
-            if not isinstance(img, dict):
-                logger.error(f"Bild {img_idx} ist kein Dictionary: {type(img)}")
-                continue
-
-            page = img.get("page", -1)
-            if page == -1: # Überspringe Bilder ohne Seitenzahl
-                 logger.warning(f"Bild {img_idx} hat keine Seitenzahl, wird übersprungen.")
-                 continue
-
-            bbox = img.get("bbox", [])
-            y = 0
-            if isinstance(bbox, (list, tuple)) and len(bbox) > 1:
-                raw_y = bbox[1] # y0 der Bounding Box
-                try:
-                    y = float(raw_y)
-                except (ValueError, TypeError):
-                    logger.warning(f"Ungültige Y-Koordinate für Bild {img_idx} auf Seite {page}: {raw_y}. Verwende 0.")
-                    y = 0
-            # elif isinstance(bbox, (int, float)): # Weniger wahrscheinlich
-            #      y = float(bbox)
-            else:
-                 logger.warning(f"Ungültige BBox für Bild {img_idx} auf Seite {page}: {bbox}. Verwende Y=0.")
-                 y = 0
-
-            if page not in elements_by_page: elements_by_page[page] = []
-            # Füge Originalindex hinzu, um das Bild später zu aktualisieren
-            img['_original_index'] = img_idx
-            elements_by_page[page].append((y, "image", img))
-
-        # Füge Trennlinien hinzu
-        for page, lines in separators_by_page.items():
-            if page not in elements_by_page: elements_by_page[page] = []
-            for y in lines:
-                elements_by_page[page].append((y, "separator", {"page": page, "y": y}))
-
-        # Sortiere Elemente auf jeder Seite nach Y-Koordinate
-        for page in elements_by_page:
-            elements_by_page[page].sort(key=lambda item: item[0]) # Sortiere nach Y
-
-        # 3. Iteriere durch sortierte Elemente und weise Bilder zu
-        assigned_count = 0
-        start_time = datetime.now()
-
-        for page, elements in elements_by_page.items():
-            current_question = None
-            logger.info(f"Verarbeite Seite {page+1} mit {len(elements)} Elementen (Fragen, Bilder, Linien)")
-
-            for y, type, data in elements:
-                if type == "question":
-                    current_question = data # Merke die letzte gesehene Frage
-                    logger.debug(f"Seite {page+1}, Y={y:.0f}: Frage {data.get('question_number', '?')} beginnt.")
-                elif type == "image":
-                    if current_question:
-                        img_idx = data['_original_index']
-                        img_data = images[img_idx] # Das Original-Bild-Dict holen
-                        question_id = current_question.get("id")
-
-                        # Weise das Bild der aktuellen Frage zu
-                        img_data["question_id"] = question_id
-
-                        # Erstelle Bildschlüssel (konsistent mit vorheriger Logik)
-                        img_y_for_key = int(y)
-                        image_key = f"{question_id}_{page}_{img_y_for_key}.{img_data.get('image_ext', 'jpg')}"
-
-                        # Aktualisiere die Frage in der Original-Liste mit dem Bildschlüssel
-                        # Suche die Frage anhand der ID in der ursprünglichen `questions`-Liste
-                        found_q = False
-                        for q_orig in questions:
-                            if q_orig.get("id") == question_id:
-                                # Füge Key hinzu oder überschreibe bestehenden (falls mehrere Bilder pro Frage)
-                                # Das letzte Bild im Block setzt den Key für die Frage
-                                q_orig["image_key"] = image_key
-                                found_q = True
-                                break
-                        if not found_q:
-                             logger.error(f"Konnte Originalfrage mit ID {question_id} zum Setzen des Image Keys nicht finden!")
-
-
-                        assigned_count += 1
-                        logger.info(f"Seite {page+1}, Y={y:.0f}: Bild {img_idx} Frage {current_question.get('question_number', '?')} ({question_id}) zugeordnet. Key: {image_key}")
-                    else:
-                        # Bild erscheint vor der ersten Frage oder nach einer Linie ohne folgende Frage
-                         logger.warning(f"Seite {page+1}, Y={y:.0f}: Bild {data.get('_original_index')} keiner Frage zugeordnet (keine vorherige Frage im Block).")
-                elif type == "separator":
-                    # Eine Linie beendet den aktuellen Block, Bilder danach gehören nicht mehr zur current_question
-                    logger.debug(f"Seite {page+1}, Y={y:.0f}: Trennlinie gefunden, setze aktuelle Frage zurück.")
-                    current_question = None # Setze zurück für nächsten Block
-
-        # Entferne den temporären Index aus den Bild-Dicts
-        for img in images:
-            if '_original_index' in img:
-                del img['_original_index']
-
-        end_time = datetime.now()
-        processing_time = (end_time - start_time).total_seconds()
-        logger.info(f"Block-basierte Bildzuordnung abgeschlossen: {assigned_count} von {len(images)} Bildern zugeordnet, Dauer: {processing_time:.2f}s")
-
-        # Gebe die (potenziell modifizierte) images-Liste zurück
-        return images
-
-    except Exception as e:
-        logger.error(f"Fehler bei der Block-basierten Bildzuordnung: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        # Im Fehlerfall die unveränderten Bilder zurückgeben
-        # Entferne temporären Index, falls vorhanden
-        for img in images:
-            if '_original_index' in img:
-                del img['_original_index']
-        return images # Gebe unveränderte Liste zurück
+    return images
 
 def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, user_id, visibility, config):
     """
