@@ -272,37 +272,57 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
 
         # Gehe durch die Fragen, um den zugewiesenen image_key zu finden
         for q in questions:
-            if q.get("image_key"):
-                image_key = q["image_key"]
-                # Finde das zugehörige Bild (oder die Bilder) mit dieser question_id
-                found_img = None
-                for img in images:
-                    # Versuche, das spezifische Bild zu finden, das diesem Key entspricht
-                    img_y_for_key = 0
-                    bbox = img.get("bbox", [0, 0])[1]
-                    try:
-                       img_y_for_key = int(float(bbox))
-                    except (ValueError, TypeError): pass
+            image_key_on_q = q.get("image_key")
+            if not image_key_on_q:
+                continue
 
-                    expected_key = f"{q.get('id')}_{img.get('page', 0)}_{img_y_for_key}.{img.get('image_ext', 'jpg')}"
+            found_img_for_upload = None # Renamed for clarity
+            for img_candidate in images:
+                # Preliminary check: was this image candidate even assigned to the current question q?
+                if img_candidate.get("question_id") != q.get("id"):
+                    continue
 
-                    if img.get("question_id") == q.get("id") and image_key == expected_key :
-                         # Prüfe, ob dieses Bild valide Daten hat
-                         if img.get("image_bytes") and len(img["image_bytes"]) >= 100:
-                             found_img = img
-                             break # Nimm das erste passende Bild
+                # Now, reconstruct the key for this img_candidate using the midpoint-Y logic,
+                # identical to how it's done in map_images_to_questions.
+                img_cand_page = img_candidate.get("page")
+                img_cand_bbox = img_candidate.get("bbox")
+                img_cand_ext = img_candidate.get("image_ext", "jpg") # Default to jpg
 
-                if found_img and image_key not in processed_image_keys:
-                     upload_tasks.append({
-                        "filename": image_key,
-                        "image_bytes": found_img["image_bytes"],
-                        "content_type": f'image/{found_img.get("image_ext", "jpg")}',
-                        "question_id": q["id"] # Wird für Logging benötigt
-                    })
-                     processed_image_keys.add(image_key)
-                elif not found_img and q.get("image_key"): # Nur warnen wenn key gesetzt war
-                    logger.warning(f"Kein gültiges Bild für Key {image_key} der Frage {q.get('question_number', '?')} gefunden für Upload.")
+                # Ensure necessary data is present for key reconstruction
+                if img_cand_page is None or not (isinstance(img_cand_bbox, (list, tuple)) and len(img_cand_bbox) == 4):
+                    logger.debug(f"Image candidate for q {q.get('id')} (key: {image_key_on_q}) lacks page or full bbox. Skipping key reconstruction for this candidate.")
+                    continue
+                
+                # Calculate the y-component of the key using the midpoint
+                mid_y_val = (img_cand_bbox[1] + img_cand_bbox[3]) / 2
+                key_y_from_img_midpoint = int(mid_y_val)
 
+                # Reconstruct the key
+                # The q.get("id") is the correct question ID part, as image_key_on_q was created using it.
+                reconstructed_key_for_candidate = f"{q.get('id')}_{img_cand_page}_{key_y_from_img_midpoint}.{img_cand_ext}"
+
+                if image_key_on_q == reconstructed_key_for_candidate:
+                    # This img_candidate matches the image_key_on_q
+                    if img_candidate.get("image_bytes") and len(img_candidate["image_bytes"]) >= 100:
+                        found_img_for_upload = img_candidate
+                        break # Found the definitive, valid image for this question's image_key
+                    else:
+                        logger.warning(f"Image data for key {image_key_on_q} (Question {q.get('question_number', '?')}) found, but image_bytes are invalid or empty. Will not upload.")
+                        # We found the metadata match, but data is bad. Stop searching for this q.
+                        break 
+            
+            if found_img_for_upload and image_key_on_q not in processed_image_keys:
+                 upload_tasks.append({
+                    "filename": image_key_on_q, # Use the original key from the question
+                    "image_bytes": found_img_for_upload["image_bytes"],
+                    "content_type": f'image/{found_img_for_upload.get("image_ext", "jpg")}',
+                    "question_id": q["id"] # For logging
+                })
+                 processed_image_keys.add(image_key_on_q)
+            elif not found_img_for_upload and image_key_on_q: 
+                # This warning will now be more accurate, as it means either the image link (question_id) was lost,
+                # or the properties (page, bbox, ext) changed, or it was found but had no bytes.
+                logger.warning(f"No valid, usable image found for key {image_key_on_q} associated with question {q.get('question_number', '?')} (ID: {q.get('id')}) during upload preparation.")
 
         # Versuche zuerst den asynchronen Upload mit Supabase
         successful_uploads = 0 # Reset counter before upload loop
