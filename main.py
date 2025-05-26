@@ -182,8 +182,10 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
             if images and questions:
                 try:
                     # Übergebe das doc-Objekt an die Mapping-Funktion
-                    images = map_images_to_questions(questions, images, doc)
-                    logger.info(f"Block-basierte Bildzuordnung: {sum(1 for img in images if img.get('question_id'))} Bilder zugeordnet")
+                    images = map_images_to_questions(questions, images, doc) # doc is not used in the new version, but signature kept for now
+                    # REMOVE MISLEADING LOG: The new function doesn't use block-based assignment.
+                    # A new, more accurate log will be part of the map_images_to_questions function itself.
+                    # logger.info(f"Block-basierte Bildzuordnung: {sum(1 for img in images if img.get('question_id'))} Bilder zugeordnet")
                 except Exception as map_error:
                     logger.error(f"Fehler bei der Bildzuordnung: {str(map_error)}")
                     import traceback
@@ -1432,46 +1434,98 @@ def extract_images_with_coords(doc: fitz.Document): # Akzeptiert doc statt pdf_p
 
 def map_images_to_questions(questions: List[Dict], images: List[Dict], doc: fitz.Document) -> List[Dict]:
     """
-    Updated implementation: assign each image to the nearest question on the same page based on vertical distance, ignoring separators.
+    Assigns images to the closest question on the same page based on vertical proximity.
+    An image is primarily assigned to a question if its vertical midpoint falls within the question's y0-y1 range.
+    If multiple such questions exist, the one with the smallest vertical span is chosen.
+    If no question 'contains' the image, it's assigned to the question with the minimum 
+    absolute vertical distance between their respective bounding box edges.
+    The 'doc' parameter is currently unused by this mapping logic but kept for signature consistency.
     """
-    # Build mapping of questions by page with valid top and bottom positions
+    logger.info(f"Starting advanced image-to-question mapping for {len(images)} images and {len(questions)} questions.")
     questions_by_page: Dict[int, List[Dict]] = {}
-    for q in questions:
+    for q_idx, q in enumerate(questions):
         page = q.get("page", -1)
-        y0 = q.get("y")
-        y1 = q.get("y1")
-        if page < 0 or y0 is None or y1 is None:
+        y0 = q.get("y") 
+        y1 = q.get("y1") # y1 is the bottom of the question block
+
+        if page < 0 or y0 is None or y1 is None or y1 < y0:
+            logger.debug(f"Question {q.get('question_number', q_idx)} (ID: {q.get('id')}) skipped due to invalid page/y-coords (Page: {page}, Y0: {y0}, Y1: {y1}).")
             continue
         questions_by_page.setdefault(page, []).append(q)
 
-    # Assign each image
-    for img in images:
-        page = img.get("page", -1)
-        bbox = img.get("bbox", [])
-        # Skip images without page or bbox
-        if page not in questions_by_page or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+    assigned_image_count = 0
+    for img_idx, img in enumerate(images):
+        img_page = img.get("page", -1)
+        img_bbox = img.get("bbox")
+
+        if img_page not in questions_by_page or not isinstance(img_bbox, (list, tuple)) or len(img_bbox) < 4:
+            logger.debug(f"Image {img_idx} skipped due to invalid page/bbox (Page: {img_page}, Bbox: {img_bbox}).")
             continue
-        # Compute vertical midpoint of the image
-        mid_y = (bbox[1] + bbox[3]) / 2
-        # Try to find a question whose region contains this midpoint
-        assigned_q = None
-        for q in questions_by_page[page]:
-            if q["y"] <= mid_y <= q.get("y1", q["y"]):
-                assigned_q = q
-                break
-        # Fallback: nearest question by top y-distance
-        if not assigned_q:
-            assigned_q = min(questions_by_page[page], key=lambda q: abs(mid_y - q["y"]))
 
-        # Assign image to this question
-        question_id = assigned_q["id"]
-        img["question_id"] = question_id
-        # Construct image key
-        ext = img.get("image_ext", "jpg")
-        key_y = int(mid_y)
-        image_key = f"{question_id}_{page}_{key_y}.{ext}"
-        assigned_q["image_key"] = image_key
+        img_y0 = img_bbox[1]
+        img_y1 = img_bbox[3]
+        img_mid_y = (img_y0 + img_y1) / 2
 
+        candidate_questions_for_img = questions_by_page[img_page]
+        
+        # 1. Check for questions that "contain" the image's midpoint
+        containing_questions = []
+        for q in candidate_questions_for_img:
+            q_y0 = q["y"]
+            q_y1 = q["y1"]
+            if q_y0 <= img_mid_y <= q_y1:
+                containing_questions.append(q)
+        
+        best_q = None
+        if containing_questions:
+            # If contained by multiple, pick the one with the smallest vertical span (tightest fit)
+            best_q = min(containing_questions, key=lambda q: q["y1"] - q["y"])
+            logger.debug(f"Image {img_idx} (Page {img_page}, MidY {img_mid_y:.2f}) is contained by question {best_q.get('question_number', best_q.get('id'))} (Y0:{best_q['y']:.2f}-Y1:{best_q['y1']:.2f}).")
+
+        # 2. If not contained, find the question with the minimum absolute vertical distance
+        if not best_q:
+            min_dist = float('inf')
+            for q in candidate_questions_for_img:
+                q_y0 = q["y"]
+                q_y1 = q["y1"]
+                
+                # Calculate distance:
+                # Distance is 0 if image and question overlap vertically.
+                # Otherwise, it's the gap between the closest edges.
+                dist = 0
+                if img_y1 < q_y0: # Image is entirely above question
+                    dist = q_y0 - img_y1
+                elif img_y0 > q_y1: # Image is entirely below question
+                    dist = img_y0 - q_y1
+                # else: they overlap, distance is 0 or could be negative if fully contained.
+                # For non-containing, we are interested in positive separation.
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    best_q = q
+            if best_q:
+                 logger.debug(f"Image {img_idx} (Page {img_page}, Y0:{img_y0:.2f}-Y1:{img_y1:.2f}) assigned to closest non-containing question {best_q.get('question_number', best_q.get('id'))} (Y0:{best_q['y']:.2f}-Y1:{best_q['y1']:.2f}) with distance {min_dist:.2f}.")
+
+
+        if best_q:
+            question_id = best_q["id"]
+            img["question_id"] = question_id
+            
+            # Key construction uses image's midpoint Y, as before
+            img_ext = img.get("image_ext", "jpg")
+            key_y_component = int(img_mid_y) 
+            image_key = f"{question_id}_{img_page}_{key_y_component}.{img_ext}"
+            
+            # Set image_key on the question. If a question gets multiple images,
+            # the last one processed for that question will set its image_key.
+            # This is consistent with previous logic.
+            best_q["image_key"] = image_key 
+            assigned_image_count +=1
+            logger.info(f"Image {img_idx} (Page {img_page}, MidY {img_mid_y:.2f}) successfully mapped to question {best_q.get('question_number', best_q.get('id'))} (ID: {question_id}). Image Key: {image_key}")
+        else:
+            logger.warning(f"Image {img_idx} on page {img_page} could not be mapped to any question.")
+
+    logger.info(f"Advanced image-to-question mapping complete: {assigned_image_count} of {len(images)} images assigned.")
     return images
 
 def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, user_id, visibility, config):
