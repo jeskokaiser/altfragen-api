@@ -714,6 +714,7 @@ async def upload_pdf(
     subject: str = Form(""),
     userId: str = Form(""), # Receive userId
     visibility: str = Form("private"), # Receive visibility, default to private
+    university_id: str = Form(""), # Receive university_id for university visibility
     background_tasks: BackgroundTasks = None
 ) -> JSONResponse:
     global current_pdf_filename
@@ -755,6 +756,45 @@ async def upload_pdf(
             }
         )
     
+    # Validiere visibility
+    if visibility not in ["private", "university"]:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "status": "error",
+                "success": False,
+                "message": "Visibility muss entweder 'private' oder 'university' sein",
+                "data": {}
+            }
+        )
+    
+    # Validiere university_id wenn visibility = "university"
+    validated_university_id = None
+    if visibility == "university":
+        if not university_id:
+            logger.warning(f"University visibility requested but no university_id provided. Falling back to private visibility.")
+            visibility = "private"
+        else:
+            # Validiere UUID format
+            try:
+                import uuid as uuid_module
+                uuid_module.UUID(university_id)
+                validated_university_id = university_id
+                logger.info(f"University assignment: Questions will be assigned to university {university_id}")
+            except ValueError:
+                logger.warning(f"Invalid university_id format: {university_id}. Falling back to private visibility.")
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={
+                        "status": "error",
+                        "success": False,
+                        "message": "University_id muss ein gültiges UUID-Format haben",
+                        "data": {}
+                    }
+                )
+    elif university_id:
+        logger.info(f"University_id provided ({university_id}) but visibility is private. University_id will be ignored.")
+    
     try:
         if not validate_pdf(file):
             raise HTTPException(
@@ -789,7 +829,8 @@ async def upload_pdf(
             "exam_semester": examSemester,
             "subject": subject,
             "user_id": userId, # Pass userId to metadata
-            "visibility": visibility # Pass visibility to metadata
+            "visibility": visibility, # Pass visibility to metadata
+            "university_id": validated_university_id # Pass validated university_id to metadata
         }
         
         # Erstelle eine Task-ID für das Tracking
@@ -801,7 +842,9 @@ async def upload_pdf(
             "message": "PDF-Verarbeitung gestartet",
             "data": {
                 "exam_name": examName,
-                "filename": file.filename
+                "filename": file.filename,
+                "visibility": visibility,
+                "university_id": validated_university_id
             }
         }
         
@@ -919,9 +962,10 @@ async def process_pdf_in_background(task_id: str, pdf_path: str, config: Config,
                     exam_semester = metadata.get("exam_semester", "")
                     user_id = metadata.get("user_id", None) # Get userId from metadata
                     visibility = metadata.get("visibility", "private") # Get visibility
+                    university_id = metadata.get("university_id", None) # Get university_id from metadata
 
                     successful_inserts, failed_inserts = insert_questions_into_db(
-                        formatted_questions, exam_name, exam_year, exam_semester, user_id, visibility, config
+                        formatted_questions, exam_name, exam_year, exam_semester, user_id, visibility, university_id, config
                     )
 
                     # 4. Aktualisiere Task-Status basierend auf DB-Ergebnis
@@ -1575,9 +1619,10 @@ def map_images_to_questions(questions: List[Dict], images: List[Dict], doc: fitz
     logger.info(f"Advanced image-to-question mapping complete: {assigned_image_count} of {len(images)} images assigned.")
     return images
 
-def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, user_id, visibility, config):
+def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, user_id, visibility, university_id, config):
     """
     Fügt Fragen in Supabase im Bulk-Modus ein für bessere Performance
+    Handles university assignment based on visibility and university_id
     """
     global current_pdf_filename
     supabase = config.supabase
@@ -1585,6 +1630,15 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
     failed = 0
     
     logger.info(f"Füge {len(questions)} Fragen in Supabase ein, Datei: {current_pdf_filename}")
+    
+    # Log university assignment details
+    if visibility == "university" and university_id:
+        logger.info(f"University assignment: {len(questions)} questions will be assigned to university {university_id}")
+    elif visibility == "university" and not university_id:
+        logger.warning(f"University visibility requested but no university_id provided. Questions will be saved as private.")
+        visibility = "private"  # Fallback to private
+    elif visibility == "private":
+        logger.info(f"Private assignment: {len(questions)} questions will be saved as private (no university assignment)")
     
     # Verwende den globalen Dateinamen oder einen Fallback
     pdf_filename = current_pdf_filename
@@ -1601,6 +1655,11 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
             
         # Sicherstellen, dass alle Werte Strings sind
         options_dict = q.get("options", {}) # Hole das verschachtelte Optionen-Dict
+
+        # Determine final university_id based on visibility and provided university_id
+        final_university_id = None
+        if visibility == "university" and university_id:
+            final_university_id = str(university_id)
 
         data = {
             "id": str(q.get("id", uuid.uuid4())),
@@ -1619,9 +1678,15 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
             "image_key": str(q.get("image_key", "")),
             "filename": pdf_filename,
             "user_id": str(user_id) if user_id else None, # Add user_id
-            "visibility": str(visibility) # Add visibility
+            "visibility": str(visibility), # Add visibility
+            "university_id": final_university_id # Add university_id (None if not university visibility)
         }
         bulk_data.append(data)
+    
+    # Log final assignment summary
+    university_assigned_count = sum(1 for item in bulk_data if item["university_id"] is not None)
+    private_count = len(bulk_data) - university_assigned_count
+    logger.info(f"Database assignment summary: {university_assigned_count} questions assigned to university, {private_count} questions as private")
     
     # Falls keine Daten vorhanden sind, beende frühzeitig
     if not bulk_data:
@@ -1830,7 +1895,7 @@ def main(pdf_path):
 
 
         # Fragen in Supabase speichern
-        insert_questions_into_db(questions, exam_name, exam_year, exam_semester, None, "private", config)
+        insert_questions_into_db(questions, exam_name, exam_year, exam_semester, None, "private", None, config)
         
         return {
             "status": "success", 
