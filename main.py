@@ -1171,14 +1171,24 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
                         next_q_y0 = next_q.get("y", float('inf'))
                         break
 
-                # Setze y1 kurz vor die nächste Frage oder ans Seitenende
+                # Setze y1 bis zur Mitte zwischen dieser und der nächsten Frage
+                # oder ans Seitenende, um Lücken zu vermeiden
                 page_end = page_heights.get(q["page"], 842) # Standard A4 Höhe
                 # Verwende y1 des Suchbegriffs als Minimum, falls verfügbar
                 start_y = q.get("y1_search_term", q.get("y", 0))
-                q["y1"] = min(next_q_y0 - 5, page_end - 10) if next_q_y0 != float('inf') else page_end - 10
-                # Stelle sicher, dass y1 nach dem Suchbegriff liegt
-                q["y1"] = max(q["y1"], start_y + 10) # Mindestens 10 Punkte Höhe
-                logger.debug(f"Frage {q.get('question_number')}: Seite {q.get('page')+1}, Bereich geschätzt: Y0={q.get('y'):.2f}, Y1={q.get('y1'):.2f}")
+                
+                if next_q_y0 != float('inf'):
+                    # Setze y1 zur Mitte zwischen aktueller und nächster Frage
+                    # Das eliminiert Lücken und sorgt für bessere Bildzuordnung
+                    midpoint = (q.get("y", 0) + next_q_y0) / 2
+                    q["y1"] = max(midpoint, start_y + 20)  # Mindestens 20 Punkte Höhe
+                else:
+                    # Letzte Frage auf der Seite - geht bis zum Seitenende
+                    q["y1"] = page_end - 10
+                
+                # Stelle sicher, dass y1 nach dem Suchbegriff liegt und eine Mindesthöhe hat
+                q["y1"] = max(q["y1"], start_y + 20) # Mindestens 20 Punkte Höhe
+                logger.debug(f"Frage {q.get('question_number')}: Seite {q.get('page')+1}, Bereich: Y0={q.get('y'):.2f}, Y1={q.get('y1'):.2f}")
 
         # Zweite Variante: Wenn keine oder nur wenige Fragen gefunden wurden, suche nach Fragezeichen-Sätzen
         if len(questions) < 5:
@@ -1365,7 +1375,7 @@ def extract_images_with_coords(doc: fitz.Document): # Akzeptiert doc statt pdf_p
                             xref = block.get("xref", 0)
                             if xref == 0 and 'image' in block and isinstance(block['image'], bytes):
                                  # Manchmal ist das Bild direkt im Block (selten)
-                                 # Diese Logik ist komplex und wird hier vereinfacht
+                                 # Diese Logik ist komplexer, da 'items' analysiert werden müssten
                                  logger.warning(f"Bild in Block {block_idx+1} ohne xref gefunden, überspringe vorerst.")
                                  continue
 
