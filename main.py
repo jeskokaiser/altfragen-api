@@ -1160,44 +1160,49 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
                     logger.warning(f"Konnte exakte Position für Frage {q['question_number']} nicht finden. Schätzung: Y={q.get('y', 0)}")
 
         # Schätze y1 (untere Grenze) für jede Frage basierend auf der nächsten Frage
-        page_heights = {p: doc[p].rect.height for p in range(len(doc))}
-        for i, q in enumerate(questions):
-            if q.get("page", -1) != -1:
-                next_q_y0 = float('inf')
-                # Suche die nächste Frage auf derselben Seite
-                for j in range(i + 1, len(questions)):
-                    next_q = questions[j]
-                    if next_q.get("page", -1) == q["page"]:
-                        next_q_y0 = next_q.get("y", float('inf'))
-                        break
+        MIN_TEXT_AREA_HEIGHT = 75  # Min height from bottom of "X. Frage:" text for options/answer
+        MARGIN_BELOW_LAST_QUESTION_ON_PAGE = 10
+        MARGIN_BEFORE_NEXT_QUESTION_TEXT = 5 # How much space to leave before the text of the next Q starts
+        ABSOLUTE_MIN_QUESTION_BLOCK_HEIGHT = 20 # Overall minimum height for a question's y0-y1 block
 
-                # Erweiterte Grenzberechnung für bessere Bildzuordnung
-                page_end = page_heights.get(q["page"], 842) # Standard A4 Höhe
-                # Verwende y1 des Suchbegriffs als Minimum, falls verfügbar
-                start_y = q.get("y1_search_term", q.get("y", 0))
-                
-                if next_q_y0 != float('inf'):
-                    # Berechne den Abstand zur nächsten Frage
-                    distance_to_next = next_q_y0 - q.get("y", 0)
-                    
-                    # Wenn der Abstand groß ist (>200 Punkte), nehmen wir an, dass dazwischen
-                    # Bilder oder andere Inhalte zur aktuellen Frage gehören
-                    if distance_to_next > 200:
-                        # Gib der aktuellen Frage 80% des Raums zur nächsten Frage
-                        q["y1"] = q.get("y", 0) + (distance_to_next * 0.8)
-                    else:
-                        # Bei kleinem Abstand verwende die Mitte
-                        q["y1"] = (q.get("y", 0) + next_q_y0) / 2
-                    
-                    # Stelle sicher, dass wir mindestens 30 Punkte vor der nächsten Frage stoppen
-                    q["y1"] = min(q["y1"], next_q_y0 - 30)
-                else:
-                    # Letzte Frage auf der Seite - geht bis zum Seitenende
-                    q["y1"] = page_end - 10
-                
-                # Stelle sicher, dass y1 nach dem Suchbegriff liegt und eine Mindesthöhe hat
-                q["y1"] = max(q["y1"], start_y + 50) # Mindestens 50 Punkte Höhe für mehr Inhalt
-                logger.debug(f"Frage {q.get('question_number')}: Seite {q.get('page')+1}, Bereich: Y0={q.get('y'):.2f}, Y1={q.get('y1'):.2f}, Abstand zur nächsten: {distance_to_next if next_q_y0 != float('inf') else 'N/A'}")
+        page_heights = {p: doc[p].rect.height for p in range(len(doc))} 
+
+        for i, q in enumerate(questions):
+            page_idx = q.get("page", -1)
+            q_y0 = q.get("y") # Top of "X. Frage:" text block
+            q_y1_text_search_marker = q.get("y1_search_term") # Bottom of "X. Frage:" text block
+
+            if page_idx == -1 or q_y0 is None:
+                logger.warning(f"Question {q.get('question_number', i)} (ID: {q.get('id')}) on page {page_idx} has no y0 ({q_y0}). Assigning default y1.")
+                q["y1"] = (q_y0 or 0) + ABSOLUTE_MIN_QUESTION_BLOCK_HEIGHT
+                continue
+
+            base_y_for_min_text_height = q_y1_text_search_marker if q_y1_text_search_marker is not None else q_y0
+
+            next_q_start_y = float('inf')
+            for j in range(i + 1, len(questions)):
+                next_q = questions[j]
+                if next_q.get("page", -1) == page_idx:
+                    next_q_start_y = next_q.get("y", float('inf'))
+                    break
+            
+            estimated_y1_based_on_next_q = 0
+            if next_q_start_y != float('inf'):
+                estimated_y1_based_on_next_q = next_q_start_y - MARGIN_BEFORE_NEXT_QUESTION_TEXT
+            else:
+                page_height = page_heights.get(page_idx, 842) 
+                estimated_y1_based_on_next_q = page_height - MARGIN_BELOW_LAST_QUESTION_ON_PAGE
+            
+            min_y1_for_text_content = base_y_for_min_text_height + MIN_TEXT_AREA_HEIGHT
+            q["y1"] = max(estimated_y1_based_on_next_q, min_y1_for_text_content)
+            
+            q["y1"] = max(q["y1"], q_y0 + ABSOLUTE_MIN_QUESTION_BLOCK_HEIGHT)
+
+            if next_q_start_y != float('inf') and q["y1"] >= next_q_start_y:
+                 q["y1"] = next_q_start_y - MARGIN_BEFORE_NEXT_QUESTION_TEXT 
+                 q["y1"] = max(q["y1"], q_y0 + ABSOLUTE_MIN_QUESTION_BLOCK_HEIGHT)
+
+            logger.debug(f"Frage {q.get('question_number')}: Seite {page_idx+1}, Bereich Y0={q_y0:.2f}, Y1={q['y1']:.2f}")
 
         # Zweite Variante: Wenn keine oder nur wenige Fragen gefunden wurden, suche nach Fragezeichen-Sätzen
         if len(questions) < 5:
