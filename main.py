@@ -133,7 +133,9 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                 "message": "Keine Fragen im PDF gefunden",
                 "data": {
                     "exam_name": exam_name,
-                    "questions_processed": 0,
+                    "total_questions_extracted": 0,
+                    "total_questions_processed": 0,
+                    "questions_ignored": 0,
                     "images_uploaded": 0,
                 },
                 "questions": [] # Leere Liste für Konsistenz
@@ -368,8 +370,14 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
 
         # Bereite Fragedaten für das Frontend auf (anstatt sie direkt in die Datenbank einzufügen)
         formatted_questions = []
+        ignored_questions_count = 0
         
         for q in questions:
+            # Prüfe, ob die Frage ignoriert werden soll
+            if should_ignore_question(q):
+                ignored_questions_count += 1
+                continue
+                
             # Verwende extrahierte Werte mit Fallback auf übergebene Metadaten
             subject = q.get("subject") or default_subject
             
@@ -392,6 +400,12 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                 "image_key": q.get("image_key", "")
             }
             formatted_questions.append(formatted_question)
+        
+        # Log information about ignored questions
+        if ignored_questions_count > 0:
+            logger.info(f"{ignored_questions_count} Fragen wurden aufgrund der Filter-Kriterien ignoriert ('Gesucht: richtig/falsch' ohne Optionen)")
+        
+        logger.info(f"{len(formatted_questions)} Fragen nach Filterung für Upload vorbereitet (von ursprünglich {len(questions)} extrahierten Fragen)")
 
         return {
             "status": "completed", # Konsistent "completed" verwenden
@@ -399,7 +413,9 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
             "data": {
                 "exam_name": exam_name,
                 "images_uploaded": successful_uploads,
-                "total_questions": len(questions),
+                "total_questions_extracted": len(questions),
+                "total_questions_processed": len(formatted_questions),
+                "questions_ignored": ignored_questions_count,
                 "total_images": len(images),
             },
             "questions": formatted_questions  # Neue Struktur für das Frontend
@@ -1984,6 +2000,53 @@ def find_separator_lines(doc: fitz.Document) -> Dict[int, List[float]]:
             logger.info(f"Seite {page_idx+1}: {len(unique_lines)} Trennlinien gefunden.")
 
     return separators_by_page
+
+def should_ignore_question(question_data: Dict) -> bool:
+    """
+    Prüft, ob eine Frage ignoriert werden soll basierend auf bestimmten Kriterien.
+    
+    Ignoriert Fragen die:
+    - Nur "Gesucht: richtig/falsch?" oder "Gesucht: richtig/falsch" enthalten UND
+    - Keine Antwortoptionen haben
+    
+    Args:
+        question_data: Dictionary mit Fragedaten
+        
+    Returns:
+        True wenn die Frage ignoriert werden soll, False sonst
+    """
+    question_text = question_data.get("question", "").strip()
+    
+    # Prüfe auf "Gesucht: richtig/falsch" Muster (mit oder ohne Fragezeichen)
+    gesucht_patterns = [
+        "gesucht: richtig/falsch?",
+        "gesucht: richtig/falsch",
+        "gesucht:richtig/falsch?", 
+        "gesucht:richtig/falsch"
+    ]
+    
+    # Normalisiere den Text für Vergleich (lowercase, entferne extra Leerzeichen)
+    normalized_question = re.sub(r'\s+', ' ', question_text.lower().strip())
+    
+    # Prüfe, ob die Frage keine Antwortoptionen hat
+    options = [
+        question_data.get("option_a", "").strip(),
+        question_data.get("option_b", "").strip(), 
+        question_data.get("option_c", "").strip(),
+        question_data.get("option_d", "").strip(),
+        question_data.get("option_e", "").strip()
+    ]
+    
+    # Zähle nicht-leere Optionen
+    non_empty_options = [opt for opt in options if opt]
+    
+    # Prüfe, ob die Frage nur aus einem der "Gesucht" Muster besteht UND keine Optionen hat
+    for pattern in gesucht_patterns:
+        if normalized_question == pattern and len(non_empty_options) == 0:
+            logger.info(f"Ignoriere Frage mit nur 'Gesucht: richtig/falsch' Text und ohne Optionen: '{question_text}'")
+            return True
+    
+    return False
 
 if __name__ == "__main__":
     uvicorn.run(
