@@ -1275,7 +1275,8 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
         logger.info(f"Gefunden: {len(question_blocks)} durch Unterstriche getrennte Blöcke")
         
         # Erste Variante: Suche nach "X. Frage:" Format
-        question_pattern = re.compile(r'(\d+)\.\s*Frage:?\s*(.*?)(?=(?:\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$))', re.DOTALL)
+        # Akzeptiere beide Optionsformate: A) oder A/
+        question_pattern = re.compile(r'(\d+)\.\s*Frage:?\s*(.*?)(?=(?:\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$))', re.DOTALL)
         
         # Gehe durch alle Blöcke
         for block_idx, block in enumerate(question_blocks):
@@ -1303,9 +1304,9 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
                         "subject": "", "correct_answer": "", "comment": ""
                     }
                     
-                    # Extrahiere Optionen A-E
+                    # Extrahiere Optionen A-E (beide Formate: A) oder A/)
                     for letter in "ABCDE":
-                        option_match = re.search(rf'{letter}\)(.*?)(?=\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
+                        option_match = re.search(rf'{letter}[\)/](.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
                         if option_match:
                             question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
                     
@@ -1330,9 +1331,9 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
                 "subject": "", "correct_answer": "", "comment": ""
             }
             
-            # Extrahiere Optionen A-E
+            # Extrahiere Optionen A-E (beide Formate: A) oder A/)
             for letter in "ABCDE":
-                option_match = re.search(rf'{letter}\)(.*?)(?=\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
+                option_match = re.search(rf'{letter}[\)/](.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
                 if option_match:
                     question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
             
@@ -1469,7 +1470,8 @@ def parse_question_details(question):
         
         # Extrahiere Optionen, falls noch nicht geschehen
         options = {}
-        option_matches = re.finditer(r'([A-E])\)(.*?)(?=\s*[A-E]\)|Fach:|Antwort:|Kommentar:|$)', full_text, re.DOTALL)
+        # Suche nach beiden Formaten: A) oder A/
+        option_matches = re.finditer(r'([A-E])[\)/](.*?)(?=\s*[A-E][\)/]|Fach:|Antwort:|Kommentar:|$)', full_text, re.DOTALL)
         for match in option_matches:
             options[match.group(1)] = match.group(2).strip()
         
