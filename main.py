@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 from datetime import datetime
 import hashlib
 import traceback
+import docx
+from io import BytesIO
 
 # Logging Konfiguration
 logging.basicConfig(
@@ -97,12 +99,160 @@ class Config:
             logger.error(f"Supabase Verbindungsfehler: {str(e)}")
             raise
 
-def validate_pdf(file: UploadFile) -> bool:
-    """Validiert die PDF-Datei"""
-    if not file.filename.endswith('.pdf'):
+def validate_file(file: UploadFile) -> bool:
+    """Validiert die Datei (PDF oder DOCX)"""
+    filename = file.filename.lower()
+    if not (filename.endswith('.pdf') or filename.endswith('.docx')):
         return False
     # Hier könnten weitere Validierungen hinzugefügt werden
     return True
+
+async def process_document(file_path: str, config: Config, metadata: Dict) -> Dict:
+    """Verarbeitet eine hochgeladene Datei (PDF oder DOCX) basierend auf ihrer Endung."""
+    file_extension = os.path.splitext(file_path)[1].lower()
+    
+    if file_extension == ".pdf":
+        # Rufe die bestehende PDF-Verarbeitungslogik auf
+        return await process_pdf(file_path, config, metadata)
+    elif file_extension == ".docx":
+        # Rufe die neue DOCX-Verarbeitungslogik auf
+        return await process_docx(file_path, config, metadata)
+    else:
+        # Dieser Fall sollte durch die Validierung bereits abgedeckt sein
+        logger.error(f"Nicht unterstützter Dateityp: {file_extension}")
+        return {
+            "status": "failed",
+            "success": False,
+            "message": f"Nicht unterstützter Dateityp: {file_extension}",
+            "data": {},
+            "questions": []
+        }
+
+async def process_docx(docx_path: str, config: Config, metadata: Dict) -> Dict:
+    """Verarbeitet eine DOCX-Datei, extrahiert Fragen und Bilder."""
+    try:
+        logger.info(f"Starte DOCX-Verarbeitung für: {docx_path}")
+        doc = docx.Document(docx_path)
+        
+        # Extrahiere Metadaten aus dem Dateinamen als Fallback
+        extracted_exam_name, _, _ = extract_exam_header(docx_path)
+        exam_name = metadata.get("exam_name") or extracted_exam_name
+        exam_year = metadata.get("exam_year", "")
+        exam_semester = metadata.get("exam_semester", "")
+        default_subject = metadata.get("subject", "")
+
+        logger.info(f"Verarbeite DOCX: {exam_name} {exam_year} {exam_semester}")
+
+        # Extrahiere Fragen und Bilder aus dem DOCX-Dokument
+        questions, images = extract_content_from_docx(doc)
+        
+        if not questions:
+            logger.warning("Keine Fragen im DOCX gefunden.")
+            return {
+                "status": "completed",
+                "success": False,
+                "message": "Keine Fragen im DOCX gefunden",
+                "data": {"exam_name": exam_name, "total_questions_extracted": 0, "total_questions_processed": 0, "questions_ignored": 0, "images_uploaded": 0},
+                "questions": []
+            }
+        
+        logger.info(f"{len(questions)} Fragen und {len(images)} Bilder aus DOCX extrahiert.")
+        
+        # Ordne Bilder den Fragen zu (DOCX-spezifische Logik)
+        if images and questions:
+            images = map_images_to_questions_docx(questions, images)
+            
+        bucket_name = "exam-images"
+        upload_tasks = []
+        processed_image_keys = set()
+        
+        # Bereite Bild-Uploads vor
+        for q in questions:
+            if q.get("image_key") and q["image_key"] not in processed_image_keys:
+                img_to_upload = next((img for img in images if img.get("image_key") == q["image_key"]), None)
+                if img_to_upload:
+                    upload_tasks.append({
+                        "filename": q["image_key"],
+                        "image_bytes": img_to_upload["image_bytes"],
+                        "content_type": f'image/{img_to_upload.get("image_ext", "png")}',
+                        "question_id": q["id"]
+                    })
+                    processed_image_keys.add(q["image_key"])
+
+        # Lade Bilder asynchron hoch
+        successful_uploads = 0
+        try:
+            batch_size = 5
+            for i in range(0, len(upload_tasks), batch_size):
+                batch = upload_tasks[i:i+batch_size]
+                upload_futures = []
+                for task in batch:
+                    upload_future = asyncio.ensure_future(upload_image_async(
+                        config, task["image_bytes"], task["filename"], bucket_name, task["content_type"]
+                    ))
+                    upload_futures.append((task, upload_future))
+                
+                for task, future in upload_futures:
+                    try:
+                        if await future:
+                            successful_uploads += 1
+                            logger.info(f"Bild {task['filename']} erfolgreich hochgeladen (verknüpft mit Frage {task['question_id']})")
+                    except Exception as e:
+                        logger.error(f"Fehler beim asynchronen Supabase-Upload von {task['filename']}: {str(e)}")
+        except Exception as async_error:
+            logger.error(f"Fehler bei der asynchronen Supabase-Upload-Methode: {str(async_error)}")
+
+        # Bereite Fragedaten für die Antwort auf
+        formatted_questions = []
+        ignored_questions_count = 0
+        for q in questions:
+            if should_ignore_question(q):
+                ignored_questions_count += 1
+                continue
+            
+            subject = q.get("subject") or default_subject
+            formatted_question = {
+                "id": q.get("id", str(uuid.uuid4())),
+                "question": q.get("question", ""),
+                "options": {
+                    "A": q.get("option_a", ""), "B": q.get("option_b", ""),
+                    "C": q.get("option_c", ""), "D": q.get("option_d", ""),
+                    "E": q.get("option_e", "")
+                },
+                "correctAnswer": q.get("correct_answer", ""),
+                "subject": subject,
+                "comment": q.get("comment", ""),
+                "difficulty": 3,
+                "semester": exam_semester,
+                "year": exam_year,
+                "image_key": q.get("image_key", "")
+            }
+            formatted_questions.append(formatted_question)
+            
+        return {
+            "status": "completed",
+            "success": True,
+            "data": {
+                "exam_name": exam_name,
+                "images_uploaded": successful_uploads,
+                "total_questions_extracted": len(questions),
+                "total_questions_processed": len(formatted_questions),
+                "questions_ignored": ignored_questions_count,
+                "total_images": len(images),
+            },
+            "questions": formatted_questions
+        }
+
+    except Exception as e:
+        logger.error(f"Fehler bei der DOCX-Verarbeitung: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "status": "failed",
+            "success": False,
+            "message": f"DOCX processing error: {str(e)}",
+            "data": {},
+            "questions": []
+        }
 
 async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
     """Verarbeitet das PDF mit verbesserter Fehlerbehandlung und Performance-Optimierungen"""
@@ -720,9 +870,9 @@ async def detailed_health_check():
     return health_status
 
 @app.post("/upload", 
-    summary="Verarbeitet eine PDF-Datei",
+    summary="Verarbeitet eine PDF- oder DOCX-Datei",
     response_description="Verarbeitungsstatus und Details")
-async def upload_pdf(
+async def upload_document(
     file: UploadFile = File(...),
     examName: str = Form(""),
     examYear: str = Form(""),
@@ -812,17 +962,18 @@ async def upload_pdf(
         logger.info(f"University_id provided ({university_id}) but visibility is private. University_id will be ignored.")
     
     try:
-        if not validate_pdf(file):
+        if not validate_file(file):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Ungültige PDF-Datei"
+                detail="Ungültige PDF- oder DOCX-Datei"
             )
 
         # Verbesserte temporäre Dateibehandlung
         temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, f"upload_{uuid.uuid4()}.pdf")
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        temp_file_path = os.path.join(temp_dir, f"upload_{uuid.uuid4()}{file_extension}")
         
-        logger.info(f"Speichere PDF '{current_pdf_filename}' in temporäre Datei: {temp_file_path}")
+        logger.info(f"Speichere Datei '{current_pdf_filename}' in temporäre Datei: {temp_file_path}")
         
         # Datei speichern und Dateihandle sofort schließen
         contents = await file.read()
@@ -867,7 +1018,7 @@ async def upload_pdf(
         # Im asynchronen Modus starten wir die Verarbeitung im Hintergrund
         # und geben sofort eine Antwort zurück
         background_tasks.add_task(
-            process_pdf_in_background, 
+            process_document_in_background, 
             task_id, 
             temp_file_path, 
             config, 
@@ -944,16 +1095,16 @@ async def check_task_status(task_id: str) -> JSONResponse:
             }
         )
 
-async def process_pdf_in_background(task_id: str, pdf_path: str, config: Config, metadata: Dict):
+async def process_document_in_background(task_id: str, pdf_path: str, config: Config, metadata: Dict):
     """
-    Verarbeitet das PDF im Hintergrund und aktualisiert den Task-Status.
+    Verarbeitet die Datei im Hintergrund und aktualisiert den Task-Status.
     """
     try:
         global processing_tasks # Declare processing_tasks as global
         logger.info(f"Starte Hintergrundverarbeitung für Task {task_id}: {pdf_path}")
         
-        # 1. Verarbeite die PDF-Datei (Extraktion, Bild-Upload)
-        processing_result = await process_pdf(pdf_path, config, metadata)
+        # 1. Verarbeite die Datei (Extraktion, Bild-Upload)
+        processing_result = await process_document(pdf_path, config, metadata)
         
         # 2. Prüfe Ergebnis der Verarbeitung
         if processing_result.get("status") == "completed" and processing_result.get("success") == True:
@@ -2047,6 +2198,87 @@ def should_ignore_question(question_data: Dict) -> bool:
             return True
     
     return False
+
+def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict]]:
+    """Extrahiert Fragen und Bilder aus einem DOCX-Dokument."""
+    questions = []
+    images = []
+    current_question_text_block = []
+    element_index = 0
+
+    # Zusammenführen von Paragraphen zu einem durchgehenden Text, getrennt durch einen speziellen Marker
+    full_text = ""
+    for para in doc.paragraphs:
+        full_text += para.text + "\n"
+
+    # Trenne den Text in Blöcke basierend auf der Unterstrich-Trennlinie
+    question_blocks = re.split(r'_{10,}', full_text)
+    
+    # Extrahiere Bilder und speichere ihre Reihenfolge
+    for rel in doc.part.rels.values():
+        if "image" in rel.target_ref:
+            image_bytes = rel.target_part.blob
+            ext = rel.target_part.content_type.split('/')[-1]
+            images.append({
+                "image_bytes": image_bytes,
+                "image_ext": ext if ext else 'png',
+                "order": len(images) # Einfache Reihenfolge
+            })
+
+    # Verarbeite die Textblöcke, um Fragen zu extrahieren
+    for block_text in question_blocks:
+        block_text = block_text.strip()
+        if not block_text:
+            continue
+        
+        # Verwende Regex, um die Frage und ihre Teile zu finden
+        question_pattern = re.compile(r'(\d+)\.\s*Frage:?\s*(.*?)(?=(?:\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$))', re.DOTALL)
+        match = question_pattern.search(block_text)
+        
+        if match:
+            question_number = match.group(1)
+            question_text = match.group(2).strip()
+            
+            q_data = {
+                "id": str(uuid.uuid4()),
+                "full_text": block_text,
+                "question_number": question_number,
+                "question": question_text,
+                "order": len(questions),
+            }
+            parse_question_details(q_data) # Füllt Optionen, Fach, etc. aus full_text
+            questions.append(q_data)
+            
+    return questions, images
+
+def map_images_to_questions_docx(questions: List[Dict], images: List[Dict]) -> List[Dict]:
+    """Ordnet Bilder Fragen in einem DOCX-Dokument zu, basierend auf ihrer Reihenfolge."""
+    if not images or not questions:
+        return images
+
+    # Da DOCX keine Koordinaten hat, nehmen wir an, ein Bild gehört zur vorhergehenden Frage
+    # Diese Logik ist eine Annäherung und könnte verfeinert werden
+    
+    # Sortiere beide nach ihrer 'order'
+    questions.sort(key=lambda q: q.get('order', 0))
+    images.sort(key=lambda i: i.get('order', 0))
+    
+    # Einfache Zuordnung: Jedes Bild wird der letzten davor gefundenen Frage zugeordnet
+    # Dies ist eine Vereinfachung. Eine bessere Methode wäre, die Position im Dokument zu verfolgen.
+    # Fürs Erste ordnen wir das N-te Bild der N-ten Frage zu, falls die Anzahl übereinstimmt.
+    
+    for i, img in enumerate(images):
+        if i < len(questions):
+            q = questions[i]
+            question_id = q["id"]
+            img["question_id"] = question_id
+            
+            image_key = f"{question_id}_docx_{i}.{img.get('image_ext', 'png')}"
+            q["image_key"] = image_key
+            img["image_key"] = image_key # Füge Key auch zum Bild hinzu
+            logger.info(f"Bild {i} der Frage {q.get('question_number', '?')} (DOCX-Reihenfolge) zugeordnet.")
+            
+    return images
 
 if __name__ == "__main__":
     uvicorn.run(
