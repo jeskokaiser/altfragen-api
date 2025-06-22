@@ -1306,7 +1306,7 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
                     
                     # Extrahiere Optionen A-E (beide Formate: A) oder A/)
                     for letter in "ABCDE":
-                        option_match = re.search(rf'{letter}[\)/](.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
+                        option_match = re.search(rf'{letter}[\)/]\s*(.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
                         if option_match:
                             question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
                     
@@ -1333,7 +1333,7 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
             
             # Extrahiere Optionen A-E (beide Formate: A) oder A/)
             for letter in "ABCDE":
-                option_match = re.search(rf'{letter}[\)/](.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
+                option_match = re.search(rf'{letter}[\)/]\s*(.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', block, re.DOTALL | re.IGNORECASE)
                 if option_match:
                     question_data[f"option_{letter.lower()}"] = option_match.group(1).strip()
             
@@ -1460,20 +1460,20 @@ def parse_question_details(question):
     """
     Parst zusätzliche Details, falls diese in der Extraktion noch nicht erfasst wurden
     """
-    # Die meisten Details sollten bereits erfasst sein, aber für den Fall, dass etwas fehlt
-    if question.get("option_a") is not None and question.get("option_b") is not None:
-        # Frage wurde bereits vollständig geparst
-        return question
-    
     try:
         full_text = question.get("full_text", "")
+        logger.info(f"Parse Details für Frage {question.get('question_number', '?')}, full_text Länge: {len(full_text)}")
         
         # Extrahiere Optionen, falls noch nicht geschehen
         options = {}
         # Suche nach beiden Formaten: A) oder A/
-        option_matches = re.finditer(r'([A-E])[\)/](.*?)(?=\s*[A-E][\)/]|Fach:|Antwort:|Kommentar:|$)', full_text, re.DOTALL)
+        # Erlaube optionale Whitespaces/Newlines nach dem Delimiter
+        option_matches = re.finditer(r'([A-E])[\)/]\s*(.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', full_text, re.DOTALL)
         for match in option_matches:
             options[match.group(1)] = match.group(2).strip()
+        
+        # Debug-Ausgabe für Optionen
+        logger.info(f"Regex fand {len(options)} Optionen für Frage {question.get('question_number', '?')}: {options}")
         
         # Aktualisiere die Frage mit fehlenden Optionen
         for letter in "ABCDE":
@@ -2228,12 +2228,16 @@ def should_ignore_question(question_data: Dict) -> bool:
         question_data.get("option_e", "").strip()
     ]
     
+    # Debug: Zeige extrahierte Optionen
+    logger.info(f"Prüfe Optionen für Frage '{question_text[:30]}...': A='{options[0][:20] if options[0] else '(leer)'}', B='{options[1][:20] if options[1] else '(leer)'}', C='{options[2][:20] if options[2] else '(leer)'}', D='{options[3][:20] if options[3] else '(leer)'}', E='{options[4][:20] if options[4] else '(leer)'}'")
+    
     # Zähle nicht-leere Optionen
     non_empty_options = [opt for opt in options if opt]
     
     # Keine Optionen = ignorieren
     if len(non_empty_options) == 0:
         logger.info(f"Ignoriere Frage ohne Antwortoptionen: '{question_text[:50]}...'")
+        logger.debug(f"Full question data: {question_data}")
         return True
     
     # Prüfe, ob die Frage nur aus einem der "Gesucht" Muster besteht
@@ -2280,6 +2284,7 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
             # Verarbeite die aktuelle Frage, falls vorhanden
             if current_question and current_block_text.strip():
                 current_question["full_text"] = current_block_text.strip()
+                logger.debug(f"Full text für Frage {current_question['question_number']}: {current_block_text[:200]}...")
                 parse_question_details(current_question)
                 questions.append(current_question)
                 logger.info(f"Frage {current_question['question_number']} abgeschlossen bei Position {document_position}")
@@ -2299,6 +2304,7 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
             # Wenn wir bereits eine Frage verarbeiten, speichere sie erst
             if current_question and current_block_text.strip():
                 current_question["full_text"] = current_block_text.strip()
+                logger.info(f"Verarbeite vorherige Frage {current_question['question_number']}, Text-Länge: {len(current_block_text)}")
                 parse_question_details(current_question)
                 questions.append(current_question)
                 logger.info(f"Frage {current_question['question_number']} abgeschlossen (neue Frage gefunden)")
