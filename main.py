@@ -421,6 +421,7 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
                     logger.info(f"Bucket {bucket_name} erstellt")
                 except Exception as create_error:
                     logger.error(f"Bucket-Erstellung fehlgeschlagen: {str(create_error)}")
+                    connections_ok = False
         except Exception as s3_error:
             logger.error(f"Fehler bei S3-Client-Initialisierung: {str(s3_error)}")
             s3_client = None
@@ -1464,16 +1465,66 @@ def parse_question_details(question):
         full_text = question.get("full_text", "")
         logger.info(f"Parse Details für Frage {question.get('question_number', '?')}, full_text Länge: {len(full_text)}")
         
+        # Debug: Zeige erste 500 Zeichen des full_text
+        logger.debug(f"Full text preview für Frage {question.get('question_number', '?')}: {full_text[:500]}")
+        
         # Extrahiere Optionen, falls noch nicht geschehen
         options = {}
-        # Suche nach beiden Formaten: A) oder A/
-        # Erlaube optionale Whitespaces/Newlines nach dem Delimiter
-        option_matches = re.finditer(r'([A-E])[\)/]\s*(.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', full_text, re.DOTALL)
-        for match in option_matches:
-            options[match.group(1)] = match.group(2).strip()
+        
+        # Verbesserte Option-Extraktion: Suche zuerst alle Option-Marker
+        option_markers = list(re.finditer(r'^([A-E])[\)/]', full_text, re.MULTILINE))
+        logger.info(f"Gefundene Option-Marker für Frage {question.get('question_number', '?')}: {[m.group(0) for m in option_markers]}")
+        
+        # Methode 1: Versuche zeilenbasierte Extraktion
+        lines = full_text.split('\n')
+        logger.info(f"Analysiere {len(lines)} Zeilen für Optionen in Frage {question.get('question_number', '?')}")
+        
+        for i, line in enumerate(lines):
+            # Behalte führende/nachfolgende Leerzeichen für besseres Debugging
+            original_line = line
+            line = line.strip()
+            
+            # Debug erste paar Zeilen
+            if i < 10:
+                logger.debug(f"Zeile {i}: '{line}'")
+            
+            # Prüfe ob die Zeile mit einem Options-Marker beginnt
+            option_match = re.match(r'^([A-E])[\)/]\s*(.*)', line)
+            if option_match:
+                letter = option_match.group(1)
+                content = option_match.group(2).strip()
+                logger.info(f"Option {letter} gefunden in Zeile {i}: Inhalt='{content}' (leer={not content})")
+                
+                # Wenn der Inhalt leer ist, schaue in die nächsten Zeilen
+                if not content and i + 1 < len(lines):
+                    logger.debug(f"Option {letter} ist leer, suche Inhalt in folgenden Zeilen...")
+                    # Sammle Text bis zur nächsten Option oder Metadaten
+                    j = i + 1
+                    content_lines = []
+                    while j < len(lines):
+                        next_line = lines[j].strip()
+                        # Stoppe bei der nächsten Option oder Metadaten
+                        if re.match(r'^[A-E][\)/]', next_line) or re.match(r'^(Fach|Antwort|Kommentar):', next_line, re.IGNORECASE):
+                            logger.debug(f"Stoppe bei Zeile {j}: '{next_line[:30]}...'")
+                            break
+                        if next_line:
+                            content_lines.append(next_line)
+                            logger.debug(f"  Füge Zeile {j} hinzu: '{next_line[:50]}...'")
+                        j += 1
+                    content = " ".join(content_lines)
+                
+                options[letter] = content.strip()
+                logger.info(f"Option {letter} final: '{content[:50]}...' (Länge: {len(content)})")
+        
+        # Methode 2: Falls keine Optionen gefunden, verwende die ursprüngliche Regex
+        if not options:
+            logger.info("Zeilenbasierte Extraktion fand keine Optionen, verwende Regex-Methode")
+            option_matches = re.finditer(r'([A-E])[\)/]\s*(.*?)(?=\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$)', full_text, re.DOTALL)
+            for match in option_matches:
+                options[match.group(1)] = match.group(2).strip()
         
         # Debug-Ausgabe für Optionen
-        logger.info(f"Regex fand {len(options)} Optionen für Frage {question.get('question_number', '?')}: {options}")
+        logger.info(f"Extrahierte {len(options)} Optionen für Frage {question.get('question_number', '?')}: {options}")
         
         # Aktualisiere die Frage mit fehlenden Optionen
         for letter in "ABCDE":
@@ -2279,11 +2330,16 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
     for para_idx, paragraph in enumerate(doc.paragraphs):
         text = paragraph.text.strip()
         
+        # Debug: Zeige die ersten paar Absätze
+        if para_idx < 20 or (current_question and current_question.get("question_number") == "52"):
+            logger.debug(f"Absatz {para_idx}: '{text[:100]}...' (Länge: {len(text)}, aktuelle Frage: {current_question['question_number'] if current_question else 'None'})")
+        
         # Prüfe auf Unterstrich-Trennlinie (Fragenende)
         if re.match(r'_{10,}$', text):
             # Verarbeite die aktuelle Frage, falls vorhanden
             if current_question and current_block_text.strip():
                 current_question["full_text"] = current_block_text.strip()
+                logger.info(f"Trennlinie gefunden - speichere Frage {current_question['question_number']} mit {len(current_block_text)} Zeichen")
                 logger.debug(f"Full text für Frage {current_question['question_number']}: {current_block_text[:200]}...")
                 parse_question_details(current_question)
                 questions.append(current_question)
@@ -2294,20 +2350,26 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
             document_position += 1
             continue
         
-        # Füge Text zum aktuellen Block hinzu
-        if text:
-            current_block_text += text + "\n"
+        # Füge Text zum aktuellen Block hinzu (auch leere Zeilen behalten)
+        current_block_text += text + "\n"
         
         # Prüfe auf Fragebeginn
         question_match = re.match(r'(\d+)\.\s*Frage:?\s*(.*)', text, re.IGNORECASE)
         if question_match:
             # Wenn wir bereits eine Frage verarbeiten, speichere sie erst
-            if current_question and current_block_text.strip():
-                current_question["full_text"] = current_block_text.strip()
-                logger.info(f"Verarbeite vorherige Frage {current_question['question_number']}, Text-Länge: {len(current_block_text)}")
-                parse_question_details(current_question)
-                questions.append(current_question)
-                logger.info(f"Frage {current_question['question_number']} abgeschlossen (neue Frage gefunden)")
+            if current_question:
+                # Entferne die neue Fragezeile vom current_block_text bevor wir die alte Frage speichern
+                temp_block_text = current_block_text
+                if temp_block_text.endswith(text + "\n"):
+                    temp_block_text = temp_block_text[:-len(text)-1]
+                
+                temp_block_text = temp_block_text.strip()
+                if temp_block_text:
+                    current_question["full_text"] = temp_block_text
+                    logger.info(f"Verarbeite vorherige Frage {current_question['question_number']}, Text-Länge: {len(temp_block_text)}")
+                    parse_question_details(current_question)
+                    questions.append(current_question)
+                    logger.info(f"Frage {current_question['question_number']} abgeschlossen (neue Frage gefunden)")
             
             # Starte eine neue Frage
             question_number = question_match.group(1)
@@ -2362,11 +2424,17 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
     # Verarbeite die letzte Frage, falls noch nicht gespeichert
     if current_question and current_block_text.strip():
         current_question["full_text"] = current_block_text.strip()
+        logger.info(f"Speichere letzte Frage {current_question['question_number']} mit {len(current_block_text)} Zeichen")
         parse_question_details(current_question)
         questions.append(current_question)
         logger.info(f"Letzte Frage {current_question['question_number']} abgeschlossen")
     
     logger.info(f"Extraktion abgeschlossen: {len(questions)} Fragen und {len(images)} Bilder mit Positionsinformationen")
+    
+    # Debug: Zeige Zusammenfassung der extrahierten Fragen
+    for q in questions:
+        has_options = any(q.get(f"option_{letter}", "") for letter in "abcde")
+        logger.info(f"Frage {q['question_number']}: Hat Optionen={has_options}, Text-Länge={len(q.get('full_text', ''))}, Fragetext='{q.get('question', '')[:50]}...'")
     
     return questions, images
 
