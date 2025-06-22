@@ -1472,8 +1472,8 @@ def parse_question_details(question):
         options = {}
         
         # Verbesserte Option-Extraktion: Suche zuerst alle Option-Marker
-        option_markers = list(re.finditer(r'^([A-E])[\)/]', full_text, re.MULTILINE))
-        logger.info(f"Gefundene Option-Marker für Frage {question.get('question_number', '?')}: {[m.group(0) for m in option_markers]}")
+        option_markers = list(re.finditer(r'^\s*([A-E])[\)/]', full_text, re.MULTILINE))
+        logger.info(f"Gefundene Option-Marker für Frage {question.get('question_number', '?')}: {[m.group(0).strip() for m in option_markers]}")
         
         # Methode 1: Versuche zeilenbasierte Extraktion
         lines = full_text.split('\n')
@@ -1488,33 +1488,31 @@ def parse_question_details(question):
             if i < 10:
                 logger.debug(f"Zeile {i}: '{line}'")
             
-            # Prüfe ob die Zeile mit einem Options-Marker beginnt
-            option_match = re.match(r'^([A-E])[\)/]\s*(.*)', line)
+            # Prüfe ob die Zeile mit einem Options-Marker beginnt (erlaube Einrückung)
+            option_match = re.match(r'^\s*([A-E])[\)/]\s*(.*)', line)
             if option_match:
                 letter = option_match.group(1)
                 content = option_match.group(2).strip()
-                logger.info(f"Option {letter} gefunden in Zeile {i}: Inhalt='{content}' (leer={not content})")
                 
-                # Wenn der Inhalt leer ist, schaue in die nächsten Zeilen
-                if not content and i + 1 < len(lines):
-                    logger.debug(f"Option {letter} ist leer, suche Inhalt in folgenden Zeilen...")
-                    # Sammle Text bis zur nächsten Option oder Metadaten
-                    j = i + 1
-                    content_lines = []
-                    while j < len(lines):
-                        next_line = lines[j].strip()
-                        # Stoppe bei der nächsten Option oder Metadaten
-                        if re.match(r'^[A-E][\)/]', next_line) or re.match(r'^(Fach|Antwort|Kommentar):', next_line, re.IGNORECASE):
-                            logger.debug(f"Stoppe bei Zeile {j}: '{next_line[:30]}...'")
-                            break
-                        if next_line:
-                            content_lines.append(next_line)
-                            logger.debug(f"  Füge Zeile {j} hinzu: '{next_line[:50]}...'")
-                        j += 1
-                    content = " ".join(content_lines)
+                # Sammle Text von nachfolgenden Zeilen, bis die nächste Option oder Metadaten gefunden werden
+                j = i + 1
+                content_lines = [content] if content else []
                 
-                options[letter] = content.strip()
-                logger.info(f"Option {letter} final: '{content[:50]}...' (Länge: {len(content)})")
+                while j < len(lines):
+                    next_line = lines[j] # Behalte Einrückung für die Logik
+                    # Prüfe ob die nächste Zeile eine neue Option oder Metadaten ist
+                    if re.match(r'^\s*[A-E][\)/]', next_line) or re.match(r'^\s*(Fach|Antwort|Kommentar):', next_line, re.IGNORECASE):
+                        break
+                    
+                    if next_line.strip():
+                        content_lines.append(next_line.strip())
+                    j += 1
+                
+                # Setze i auf die letzte verarbeitete Zeile, um Doppelverarbeitung zu vermeiden
+                i = j - 1
+                
+                options[letter] = " ".join(content_lines).strip()
+                logger.debug(f"Option {letter}: '{options[letter][:50]}...'")
         
         # Methode 2: Falls keine Optionen gefunden, verwende die ursprüngliche Regex
         if not options:
