@@ -228,6 +228,11 @@ async def process_docx(docx_path: str, config: Config, metadata: Dict) -> Dict:
                 "image_key": q.get("image_key", "")
             }
             formatted_questions.append(formatted_question)
+        
+        # Log detailed filtering information
+        if ignored_questions_count > 0:
+            logger.info(f"DOCX-Verarbeitung: {ignored_questions_count} von {len(questions)} Fragen wurden ignoriert.")
+            logger.info(f"Gründe: zu kurzer Text, keine Antwortoptionen, oder nur Platzhalter-Text.")
             
         return {
             "status": "completed",
@@ -553,7 +558,7 @@ async def process_pdf(pdf_path: str, config: Config, metadata: Dict) -> Dict:
         
         # Log information about ignored questions
         if ignored_questions_count > 0:
-            logger.info(f"{ignored_questions_count} Fragen wurden aufgrund der Filter-Kriterien ignoriert ('Gesucht: richtig/falsch' ohne Optionen)")
+            logger.info(f"{ignored_questions_count} Fragen wurden aufgrund der Filter-Kriterien ignoriert (zu kurzer Text, keine Optionen, etc.)")
         
         logger.info(f"{len(formatted_questions)} Fragen nach Filterung für Upload vorbereitet (von ursprünglich {len(questions)} extrahierten Fragen)")
 
@@ -1816,12 +1821,36 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
     
     # Bereite Daten für Bulk-Upload vor
     bulk_data = []
+    skipped_in_db_prep = 0
+    
     for q in questions:
         # Die Struktur kommt jetzt von formatted_questions, parse_question_details ist hier nicht mehr nötig
         # (wurde bereits in process_pdf angewendet)
             
         # Sicherstellen, dass alle Werte Strings sind
         options_dict = q.get("options", {}) # Hole das verschachtelte Optionen-Dict
+        
+        # Finale Validierung vor DB-Insert - sollte eigentlich nicht nötig sein, aber zur Sicherheit
+        question_text = str(q.get("question", "")).strip()
+        if len(question_text) < 5:
+            logger.warning(f"DB-Prep: Überspringe Frage mit zu kurzem Text beim DB-Insert: '{question_text}'")
+            skipped_in_db_prep += 1
+            continue
+            
+        # Prüfe Optionen nochmals
+        options_list = [
+            str(options_dict.get("A", "")).strip(),
+            str(options_dict.get("B", "")).strip(),
+            str(options_dict.get("C", "")).strip(),
+            str(options_dict.get("D", "")).strip(),
+            str(options_dict.get("E", "")).strip()
+        ]
+        non_empty_options = [opt for opt in options_list if opt]
+        
+        if len(non_empty_options) == 0:
+            logger.warning(f"DB-Prep: Überspringe Frage ohne Optionen beim DB-Insert: '{question_text[:50]}...'")
+            skipped_in_db_prep += 1
+            continue
 
         # Determine final university_id based on visibility and provided university_id
         final_university_id = None
@@ -1833,7 +1862,7 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
             "exam_name": str(exam_name or ""),
             "exam_year": str(exam_year or ""),
             "exam_semester": str(exam_semester or ""),
-            "question": str(q.get("question", "")),
+            "question": question_text,  # Verwende validierte Version
             "option_a": str(options_dict.get("A", "")), # Zugriff über options_dict
             "option_b": str(options_dict.get("B", "")), # Zugriff über options_dict
             "option_c": str(options_dict.get("C", "")), # Zugriff über options_dict
@@ -1849,6 +1878,9 @@ def insert_questions_into_db(questions, exam_name, exam_year, exam_semester, use
             "university_id": final_university_id # Add university_id (None if not university visibility)
         }
         bulk_data.append(data)
+    
+    if skipped_in_db_prep > 0:
+        logger.warning(f"DB-Insert-Vorbereitung: {skipped_in_db_prep} weitere Fragen wurden beim finalen Check übersprungen.")
     
     # Log final assignment summary
     university_assigned_count = sum(1 for item in bulk_data if item["university_id"] is not None)
@@ -2157,8 +2189,9 @@ def should_ignore_question(question_data: Dict) -> bool:
     Prüft, ob eine Frage ignoriert werden soll basierend auf bestimmten Kriterien.
     
     Ignoriert Fragen die:
-    - Nur "Gesucht: richtig/falsch?" oder "Gesucht: richtig/falsch" enthalten UND
-    - Keine Antwortoptionen haben
+    - Keinen oder nur sehr kurzen Fragetext haben (< 5 Zeichen)
+    - Keine Antwortoptionen haben (mindestens eine Option muss vorhanden sein)
+    - Nur "Gesucht: richtig/falsch?" oder ähnliche Platzhalter enthalten
     
     Args:
         question_data: Dictionary mit Fragedaten
@@ -2168,7 +2201,12 @@ def should_ignore_question(question_data: Dict) -> bool:
     """
     question_text = question_data.get("question", "").strip()
     
-    # Prüfe auf "Gesucht: richtig/falsch" Muster (mit oder ohne Fragezeichen)
+    # 1. Prüfe auf leeren oder zu kurzen Fragetext
+    if len(question_text) < 5:
+        logger.info(f"Ignoriere Frage mit zu kurzem Text (< 5 Zeichen): '{question_text}'")
+        return True
+    
+    # 2. Prüfe auf "Gesucht: richtig/falsch" Muster (mit oder ohne Fragezeichen)
     gesucht_patterns = [
         "gesucht: richtig/falsch?",
         "gesucht: richtig/falsch",
@@ -2179,7 +2217,7 @@ def should_ignore_question(question_data: Dict) -> bool:
     # Normalisiere den Text für Vergleich (lowercase, entferne extra Leerzeichen)
     normalized_question = re.sub(r'\s+', ' ', question_text.lower().strip())
     
-    # Prüfe, ob die Frage keine Antwortoptionen hat
+    # 3. Prüfe, ob die Frage mindestens eine Antwortoption hat
     options = [
         question_data.get("option_a", "").strip(),
         question_data.get("option_b", "").strip(), 
@@ -2191,11 +2229,21 @@ def should_ignore_question(question_data: Dict) -> bool:
     # Zähle nicht-leere Optionen
     non_empty_options = [opt for opt in options if opt]
     
-    # Prüfe, ob die Frage nur aus einem der "Gesucht" Muster besteht UND keine Optionen hat
+    # Keine Optionen = ignorieren
+    if len(non_empty_options) == 0:
+        logger.info(f"Ignoriere Frage ohne Antwortoptionen: '{question_text[:50]}...'")
+        return True
+    
+    # Prüfe, ob die Frage nur aus einem der "Gesucht" Muster besteht
     for pattern in gesucht_patterns:
-        if normalized_question == pattern and len(non_empty_options) == 0:
-            logger.info(f"Ignoriere Frage mit nur 'Gesucht: richtig/falsch' Text und ohne Optionen: '{question_text}'")
+        if normalized_question == pattern:
+            logger.info(f"Ignoriere Frage mit nur 'Gesucht: richtig/falsch' Text: '{question_text}'")
             return True
+    
+    # 4. Zusätzliche Prüfung: Frage besteht nur aus Zahlen oder Sonderzeichen
+    if re.match(r'^[\d\s\.\-\_]+$', question_text):
+        logger.info(f"Ignoriere Frage die nur aus Zahlen/Sonderzeichen besteht: '{question_text}'")
+        return True
     
     return False
 
@@ -2226,7 +2274,7 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
             })
 
     # Verarbeite die Textblöcke, um Fragen zu extrahieren
-    for block_text in question_blocks:
+    for block_idx, block_text in enumerate(question_blocks):
         block_text = block_text.strip()
         if not block_text:
             continue
@@ -2239,6 +2287,11 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
             question_number = match.group(1)
             question_text = match.group(2).strip()
             
+            # Überspringe, wenn der Fragetext leer ist
+            if not question_text:
+                logger.warning(f"DOCX Block {block_idx}: Frage {question_number} hat keinen Text nach 'Frage:', überspringe.")
+                continue
+            
             q_data = {
                 "id": str(uuid.uuid4()),
                 "full_text": block_text,
@@ -2248,6 +2301,9 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
             }
             parse_question_details(q_data) # Füllt Optionen, Fach, etc. aus full_text
             questions.append(q_data)
+        else:
+            # Log wenn kein Frage-Pattern gefunden wurde, aber Block-Text vorhanden ist
+            logger.debug(f"DOCX Block {block_idx}: Kein Frage-Pattern gefunden. Block-Text-Länge: {len(block_text)}")
             
     return questions, images
 
