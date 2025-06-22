@@ -2248,92 +2248,159 @@ def should_ignore_question(question_data: Dict) -> bool:
     return False
 
 def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict]]:
-    """Extrahiert Fragen und Bilder aus einem DOCX-Dokument."""
+    """Extrahiert Fragen und Bilder aus einem DOCX-Dokument mit korrekter Positionsverfolgung."""
     questions = []
     images = []
-    current_question_text_block = []
-    element_index = 0
-
-    # Zusammenführen von Paragraphen zu einem durchgehenden Text, getrennt durch einen speziellen Marker
-    full_text = ""
-    for para in doc.paragraphs:
-        full_text += para.text + "\n"
-
-    # Trenne den Text in Blöcke basierend auf der Unterstrich-Trennlinie
-    question_blocks = re.split(r'_{10,}', full_text)
+    current_question = None
+    current_block_text = ""
+    document_position = 0
     
-    # Extrahiere Bilder und speichere ihre Reihenfolge
-    for rel in doc.part.rels.values():
+    # Erstelle eine Map von Bild-IDs zu Bilddaten
+    image_map = {}
+    for rel_id, rel in doc.part.rels.items():
         if "image" in rel.target_ref:
             image_bytes = rel.target_part.blob
             ext = rel.target_part.content_type.split('/')[-1]
-            images.append({
+            image_map[rel_id] = {
                 "image_bytes": image_bytes,
                 "image_ext": ext if ext else 'png',
-                "order": len(images) # Einfache Reihenfolge
-            })
-
-    # Verarbeite die Textblöcke, um Fragen zu extrahieren
-    for block_idx, block_text in enumerate(question_blocks):
-        block_text = block_text.strip()
-        if not block_text:
+                "rel_id": rel_id
+            }
+    
+    logger.info(f"DOCX enthält {len(image_map)} Bilder")
+    
+    # Sequenziell durch das Dokument gehen
+    for para_idx, paragraph in enumerate(doc.paragraphs):
+        text = paragraph.text.strip()
+        
+        # Prüfe auf Unterstrich-Trennlinie (Fragenende)
+        if re.match(r'_{10,}$', text):
+            # Verarbeite die aktuelle Frage, falls vorhanden
+            if current_question and current_block_text.strip():
+                current_question["full_text"] = current_block_text.strip()
+                parse_question_details(current_question)
+                questions.append(current_question)
+                logger.info(f"Frage {current_question['question_number']} abgeschlossen bei Position {document_position}")
+            
+            current_question = None
+            current_block_text = ""
+            document_position += 1
             continue
         
-        # Verwende Regex, um die Frage und ihre Teile zu finden
-        question_pattern = re.compile(r'(\d+)\.\s*Frage:?\s*(.*?)(?=(?:\s*[A-E]\)|\s*Fach:|\s*Antwort:|\s*Kommentar:|$))', re.DOTALL)
-        match = question_pattern.search(block_text)
+        # Füge Text zum aktuellen Block hinzu
+        if text:
+            current_block_text += text + "\n"
         
-        if match:
-            question_number = match.group(1)
-            question_text = match.group(2).strip()
+        # Prüfe auf Fragebeginn
+        question_match = re.match(r'(\d+)\.\s*Frage:?\s*(.*)', text, re.IGNORECASE)
+        if question_match:
+            # Wenn wir bereits eine Frage verarbeiten, speichere sie erst
+            if current_question and current_block_text.strip():
+                current_question["full_text"] = current_block_text.strip()
+                parse_question_details(current_question)
+                questions.append(current_question)
+                logger.info(f"Frage {current_question['question_number']} abgeschlossen (neue Frage gefunden)")
             
-            # Überspringe, wenn der Fragetext leer ist
-            if not question_text:
-                logger.warning(f"DOCX Block {block_idx}: Frage {question_number} hat keinen Text nach 'Frage:', überspringe.")
-                continue
+            # Starte eine neue Frage
+            question_number = question_match.group(1)
+            question_text = question_match.group(2).strip()
             
-            q_data = {
+            current_question = {
                 "id": str(uuid.uuid4()),
-                "full_text": block_text,
                 "question_number": question_number,
-                "question": question_text,
-                "order": len(questions),
+                "question": question_text if question_text else "",  # Fragetext könnte in nächster Zeile sein
+                "document_position": document_position,
+                "full_text": "",
+                "option_a": "", "option_b": "", "option_c": "", "option_d": "", "option_e": "",
+                "subject": "", "correct_answer": "", "comment": ""
             }
-            parse_question_details(q_data) # Füllt Optionen, Fach, etc. aus full_text
-            questions.append(q_data)
-        else:
-            # Log wenn kein Frage-Pattern gefunden wurde, aber Block-Text vorhanden ist
-            logger.debug(f"DOCX Block {block_idx}: Kein Frage-Pattern gefunden. Block-Text-Länge: {len(block_text)}")
-            
+            current_block_text = text + "\n"  # Reset block text mit aktuellem Text
+            document_position += 1
+            logger.info(f"Neue Frage {question_number} bei Position {document_position} gefunden")
+        
+        # Prüfe auf Bilder in diesem Absatz
+        for run in paragraph.runs:
+            # Überprüfe inline shapes (Bilder)
+            if hasattr(run._element, 'drawing_lst'):
+                for drawing in run._element.drawing_lst:
+                    # Extrahiere die Bild-Referenz
+                    for blip in drawing.iter('{http://schemas.openxmlformats.org/drawingml/2006/main}blip'):
+                        embed_id = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                        if embed_id and embed_id in image_map:
+                            image_data = image_map[embed_id].copy()
+                            image_data["document_position"] = document_position
+                            image_data["associated_question_number"] = current_question["question_number"] if current_question else None
+                            images.append(image_data)
+                            logger.info(f"Bild bei Position {document_position} gefunden, zugeordnet zu Frage {image_data['associated_question_number']}")
+                            document_position += 1
+        
+        # Alternative Methode für Bilder (für andere DOCX-Strukturen)
+        if hasattr(paragraph._element, 'r_lst'):
+            for r in paragraph._element.r_lst:
+                for drawing in r.findall('.//w:drawing', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}):
+                    for blip in drawing.findall('.//a:blip', namespaces={'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}):
+                        embed_id = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                        if embed_id and embed_id in image_map:
+                            # Prüfe ob dieses Bild schon hinzugefügt wurde
+                            already_added = any(img.get('rel_id') == embed_id and img.get('document_position') == document_position for img in images)
+                            if not already_added:
+                                image_data = image_map[embed_id].copy()
+                                image_data["document_position"] = document_position
+                                image_data["associated_question_number"] = current_question["question_number"] if current_question else None
+                                images.append(image_data)
+                                logger.info(f"Bild (alternative Methode) bei Position {document_position} gefunden, zugeordnet zu Frage {image_data['associated_question_number']}")
+                                document_position += 1
+    
+    # Verarbeite die letzte Frage, falls noch nicht gespeichert
+    if current_question and current_block_text.strip():
+        current_question["full_text"] = current_block_text.strip()
+        parse_question_details(current_question)
+        questions.append(current_question)
+        logger.info(f"Letzte Frage {current_question['question_number']} abgeschlossen")
+    
+    logger.info(f"Extraktion abgeschlossen: {len(questions)} Fragen und {len(images)} Bilder mit Positionsinformationen")
+    
     return questions, images
 
 def map_images_to_questions_docx(questions: List[Dict], images: List[Dict]) -> List[Dict]:
-    """Ordnet Bilder Fragen in einem DOCX-Dokument zu, basierend auf ihrer Reihenfolge."""
+    """Ordnet Bilder Fragen in einem DOCX-Dokument zu, basierend auf ihrer Position im Dokument."""
     if not images or not questions:
         return images
 
-    # Da DOCX keine Koordinaten hat, nehmen wir an, ein Bild gehört zur vorhergehenden Frage
-    # Diese Logik ist eine Annäherung und könnte verfeinert werden
+    # Erstelle eine Map von Fragenummern zu Fragen-IDs
+    question_map = {q["question_number"]: q for q in questions}
     
-    # Sortiere beide nach ihrer 'order'
-    questions.sort(key=lambda q: q.get('order', 0))
-    images.sort(key=lambda i: i.get('order', 0))
+    logger.info(f"Starte DOCX Bild-zu-Frage-Zuordnung für {len(images)} Bilder")
     
-    # Einfache Zuordnung: Jedes Bild wird der letzten davor gefundenen Frage zugeordnet
-    # Dies ist eine Vereinfachung. Eine bessere Methode wäre, die Position im Dokument zu verfolgen.
-    # Fürs Erste ordnen wir das N-te Bild der N-ten Frage zu, falls die Anzahl übereinstimmt.
-    
-    for i, img in enumerate(images):
-        if i < len(questions):
-            q = questions[i]
-            question_id = q["id"]
+    assigned_count = 0
+    for img_idx, img in enumerate(images):
+        # Die Zuordnung wurde bereits während der Extraktion gemacht
+        associated_question_number = img.get("associated_question_number")
+        
+        if associated_question_number and associated_question_number in question_map:
+            question = question_map[associated_question_number]
+            question_id = question["id"]
             img["question_id"] = question_id
             
-            image_key = f"{question_id}_docx_{i}.{img.get('image_ext', 'png')}"
-            q["image_key"] = image_key
-            img["image_key"] = image_key # Füge Key auch zum Bild hinzu
-            logger.info(f"Bild {i} der Frage {q.get('question_number', '?')} (DOCX-Reihenfolge) zugeordnet.")
+            # Erstelle einen eindeutigen image_key
+            image_key = f"{question_id}_docx_{img_idx}.{img.get('image_ext', 'png')}"
             
+            # Wenn die Frage bereits einen image_key hat (mehrere Bilder), füge eine Nummer hinzu
+            if question.get("image_key"):
+                # Zähle wie viele Bilder bereits dieser Frage zugeordnet wurden
+                existing_images = sum(1 for i in images[:img_idx] if i.get("question_id") == question_id)
+                image_key = f"{question_id}_docx_{existing_images + 1}.{img.get('image_ext', 'png')}"
+            
+            question["image_key"] = image_key
+            img["image_key"] = image_key
+            assigned_count += 1
+            
+            logger.info(f"Bild {img_idx} erfolgreich zu Frage {associated_question_number} (ID: {question_id}) zugeordnet. Key: {image_key}")
+        else:
+            logger.warning(f"Bild {img_idx} konnte keiner Frage zugeordnet werden (associated_question_number: {associated_question_number})")
+    
+    logger.info(f"DOCX Bild-zu-Frage-Zuordnung abgeschlossen: {assigned_count} von {len(images)} Bildern zugeordnet")
+    
     return images
 
 if __name__ == "__main__":
