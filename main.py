@@ -2315,11 +2315,41 @@ def should_ignore_question(question_data: Dict) -> bool:
 
 def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict]]:
     """Extrahiert Fragen und Bilder aus einem DOCX-Dokument mit korrekter Positionsverfolgung."""
+    
+    def get_paragraph_list_info(paragraph):
+        """Extrahiert List-Informationen aus einem Word-Absatz."""
+        try:
+            # Methode 1: Prüfe numPr (numbering properties)
+            if hasattr(paragraph, '_element') and hasattr(paragraph._element, 'pPr'):
+                pPr = paragraph._element.pPr
+                if pPr is not None:
+                    # Suche nach numPr Element
+                    numPr = pPr.find('.//w:numPr', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+                    if numPr is not None:
+                        # Dies ist ein nummerierter/Aufzählungs-Absatz
+                        ilvl = numPr.find('.//w:ilvl', namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+                        level = int(ilvl.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val', '0')) if ilvl is not None else 0
+                        logger.debug(f"NumPr gefunden: Level {level}")
+                        return True, level
+            
+            # Methode 2: Prüfe den Paragraph Style
+            if hasattr(paragraph, 'style') and paragraph.style:
+                style_name = paragraph.style.name.lower() if paragraph.style.name else ""
+                # Typische List-Style-Namen
+                if any(keyword in style_name for keyword in ['list', 'bullet', 'number', 'enumerat']):
+                    logger.debug(f"List-Style erkannt: {paragraph.style.name}")
+                    return True, 0
+                    
+        except Exception as e:
+            logger.debug(f"Fehler beim Extrahieren der List-Info: {e}")
+        return False, 0
+    
     questions = []
     images = []
     current_question = None
     current_block_text = ""
     document_position = 0
+    list_item_counter = {}  # Zähler für List-Items pro Level
     
     # Erstelle eine Map von Bild-IDs zu Bilddaten
     image_map = {}
@@ -2339,14 +2369,45 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
     for para_idx, paragraph in enumerate(doc.paragraphs):
         text = paragraph.text.strip()
         
+        # Prüfe ob dieser Absatz Teil einer nummerierten Liste ist
+        is_list_item, list_level = get_paragraph_list_info(paragraph)
+        list_label = ""
+        
+        if is_list_item and current_question:
+            # Erhöhe den Zähler für dieses Level
+            if list_level not in list_item_counter:
+                list_item_counter[list_level] = 0
+            
+            # Wenn wir zu einem niedrigeren Level zurückkehren, setze höhere Level zurück
+            for level in list(list_item_counter.keys()):
+                if level > list_level:
+                    del list_item_counter[level]
+            
+            list_item_counter[list_level] += 1
+            counter = list_item_counter[list_level]
+            
+            # Erstelle das Label basierend auf dem Zähler (A), B), etc.)
+            if counter <= 5:  # Nur A-E
+                list_label = f"{chr(64 + counter)})"  # A), B), etc.
+                logger.debug(f"Liste erkannt in Absatz {para_idx}: Level {list_level}, Label: {list_label}")
+        
+        # Wenn eine neue Frage beginnt, setze die List-Zähler zurück
+        if re.match(r'^\s*(\d+)\.\s*Frage:?\s*(.*)', text, re.IGNORECASE):
+            list_item_counter.clear()
+        
         # Debug: Zeige die ersten paar Absätze
         if para_idx < 20 or (current_question and current_question.get("question_number") == "52"):
-            logger.debug(f"Absatz {para_idx}: '{text[:100]}...' (Länge: {len(text)}, aktuelle Frage: {current_question['question_number'] if current_question else 'None'})")
+            logger.debug(f"Absatz {para_idx}: '{text[:100]}...' (Länge: {len(text)}, aktuelle Frage: {current_question['question_number'] if current_question else 'None'}, List: {list_label})")
         
         # Prüfe auf Unterstrich-Trennlinie (Fragenende)
         if re.match(r'_{10,}$', text):
+            logger.info(f"Trennlinie gefunden bei Absatz {para_idx}")
             # Verarbeite die aktuelle Frage, falls vorhanden
-            if current_question and current_block_text.strip():
+            if current_question:
+                # Entferne die Trennlinie selbst vom Text
+                if current_block_text.endswith(text + "\n"):
+                    current_block_text = current_block_text[:-len(text)-1]
+                
                 current_question["full_text"] = current_block_text.strip()
                 logger.info(f"Trennlinie gefunden - speichere Frage {current_question['question_number']} mit {len(current_block_text)} Zeichen")
                 logger.debug(f"Full text für Frage {current_question['question_number']}: {current_block_text[:200]}...")
@@ -2357,10 +2418,16 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
             current_question = None
             current_block_text = ""
             document_position += 1
+            list_item_counter.clear()  # Reset list counters
             continue
         
         # Füge Text zum aktuellen Block hinzu (auch leere Zeilen behalten)
-        current_block_text += text + "\n"
+        # Wenn es eine nummerierte Liste ist, füge das Label voran
+        if list_label and current_question:
+            current_block_text += f"{list_label} {text}\n"
+            logger.info(f"Füge List-Item zu Frage {current_question['question_number']} hinzu: {list_label} {text[:50]}...")
+        else:
+            current_block_text += text + "\n"
         
         # Prüfe auf Fragebeginn (erlaube Einrückung)
         question_match = re.match(r'^\s*(\d+)\.\s*Frage:?\s*(.*)', text, re.IGNORECASE)
@@ -2395,6 +2462,7 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
             }
             current_block_text = text + "\n"  # Reset block text mit aktuellem Text
             document_position += 1
+            list_item_counter.clear()  # Reset list counters for new question
             logger.info(f"Neue Frage {question_number} bei Position {document_position} gefunden")
         
         # Prüfe auf Bilder in diesem Absatz
@@ -2443,7 +2511,20 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
     # Debug: Zeige Zusammenfassung der extrahierten Fragen
     for q in questions:
         has_options = any(q.get(f"option_{letter}", "") for letter in "abcde")
-        logger.info(f"Frage {q['question_number']}: Hat Optionen={has_options}, Text-Länge={len(q.get('full_text', ''))}, Fragetext='{q.get('question', '')[:50]}...'")
+        # Prüfe ob Optionen mit List-Labels extrahiert wurden
+        has_list_options = any(
+            re.match(r'^[A-E]\)', q.get(f"option_{letter}", "").strip()[:2]) 
+            for letter in "abcde" 
+            if q.get(f"option_{letter}", "")
+        )
+        logger.info(f"Frage {q['question_number']}: Hat Optionen={has_options}, Hat List-Format={has_list_options}, Text-Länge={len(q.get('full_text', ''))}, Fragetext='{q.get('question', '')[:50]}...'")
+        
+        # Debug: Zeige die ersten paar Zeichen jeder Option
+        if has_options:
+            for letter in "abcde":
+                opt = q.get(f"option_{letter}", "")
+                if opt:
+                    logger.debug(f"  Option {letter.upper()}: '{opt[:30]}...'")
     
     return questions, images
 
