@@ -23,7 +23,7 @@ import traceback
 import docx
 from io import BytesIO
 
-# Logging Konfiguration
+# Logging Konfiguration with a custom format
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
