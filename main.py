@@ -1277,7 +1277,8 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
         
         # Erste Variante: Suche nach "X. Frage:" Format
         # Akzeptiere beide Optionsformate: A) oder A/
-        question_pattern = re.compile(r'(\d+)\.\s*Frage:?\s*(.*?)(?=(?:\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$))', re.DOTALL)
+        # Erlaube auch eingerückte Fragen
+        question_pattern = re.compile(r'^\s*(\d+)\.\s*Frage:?\s*(.*?)(?=(?:\s*[A-E][\)/]|\s*Fach:|\s*Antwort:|\s*Kommentar:|$))', re.DOTALL | re.MULTILINE)
         
         # Gehe durch alle Blöcke
         for block_idx, block in enumerate(question_blocks):
@@ -1288,8 +1289,8 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
             # Extrahiere die Fragenummer und den Fragetext
             question_match = question_pattern.search(block)
             if not question_match:
-                # Alternative Fragemuster
-                alt_match = re.search(r'(?:Was|Welche|Wo|Wann|Wie|Warum).*?\?', block, re.DOTALL | re.IGNORECASE) # Ignore case
+                # Alternative Fragemuster (erlaube Einrückung)
+                alt_match = re.search(r'^\s*(?:Was|Welche|Wo|Wann|Wie|Warum).*?\?', block, re.DOTALL | re.IGNORECASE | re.MULTILINE)
                 if alt_match:
                     question_text = alt_match.group(0).strip()
                     logger.info(f"Alternative Frage gefunden (Block {block_idx+1}): {question_text[:50]}")
@@ -1360,19 +1361,28 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
         for i, q in enumerate(questions):
             # Nur suchen, wenn Seite/Y noch nicht exakt bestimmt wurden
             if q.get("page", -1) == -1 or q.get("y", 0) <= 0:
-                search_pattern = f"{q['question_number']}. Frage:"
+                # Erstelle verschiedene Suchmuster für den Fall, dass die Frage eingerückt ist
+                search_patterns = [
+                    f"{q['question_number']}. Frage:",
+                    f"\t{q['question_number']}. Frage:",
+                    f"  {q['question_number']}. Frage:",
+                    f"    {q['question_number']}. Frage:"
+                ]
                 found = False
                 for page_idx in range(len(doc)):
                     page = doc[page_idx]
-                    search_results = page.search_for(search_pattern, quads=True)
-                    if search_results:
-                        first_quad = search_results[0] # Dies ist ein Quad-Objekt
-                        q["page"] = page_idx
-                        q["y"] = first_quad.ul.y # Genauere Y-Position (oben)
-                        # Speichere auch y1 (unten) des Suchbegriffs
-                        q["y1_search_term"] = first_quad.ll.y
-                        logger.info(f"Frage {q['question_number']} exakt auf Seite {page_idx+1} bei Y={q['y']:.2f} gefunden.")
-                        found = True
+                    for search_pattern in search_patterns:
+                        search_results = page.search_for(search_pattern, quads=True)
+                        if search_results:
+                            first_quad = search_results[0] # Dies ist ein Quad-Objekt
+                            q["page"] = page_idx
+                            q["y"] = first_quad.ul.y # Genauere Y-Position (oben)
+                            # Speichere auch y1 (unten) des Suchbegriffs
+                            q["y1_search_term"] = first_quad.ll.y
+                            logger.info(f"Frage {q['question_number']} exakt auf Seite {page_idx+1} bei Y={q['y']:.2f} gefunden.")
+                            found = True
+                            break
+                    if found:
                         break
                 if not found:
                     logger.warning(f"Konnte exakte Position für Frage {q['question_number']} nicht finden. Schätzung: Y={q.get('y', 0)}")
@@ -1429,7 +1439,8 @@ def extract_questions_with_coords(pdf_path_or_doc): # Akzeptiert Pfad oder Doc
             # Verwende den gesamten Text, um Sätze zu finden
             try:
                 full_doc_text = doc.get_text()
-                question_sentences = re.findall(r'(?:[^.!?]*?(?:Was|Welche|Wo|Wann|Wie|Warum)[^.!?]*?\?)', full_doc_text, re.IGNORECASE)
+                # Erlaube eingerückte Fragesätze
+                question_sentences = re.findall(r'^\s*(?:[^.!?]*?(?:Was|Welche|Wo|Wann|Wie|Warum)[^.!?]*?\?)', full_doc_text, re.IGNORECASE | re.MULTILINE)
                 valid_sentences = [s.strip() for s in question_sentences if len(s.strip()) > 20]
 
                 # Füge diese als Fragen hinzu, aber ohne genaue Position
@@ -2172,9 +2183,9 @@ def analyze_pdf_structure(pdf_path):
             
             # Suche nach bestimmten Mustern
             patterns = {
-                "Frage-Muster 1": r"\d+\.\s*Frage:",
-                "Frage-Muster 2": r"Frage\s*\d+[:\.]",
-                "Optionen": r"[A-E]\)",
+                "Frage-Muster 1": r"^\s*\d+\.\s*Frage:",
+                "Frage-Muster 2": r"^\s*Frage\s*\d+[:\.]",
+                "Optionen": r"^\s*[A-E]\)",
                 "Unterstrichtrennungen": r"_{5,}",
             }
             
@@ -2351,8 +2362,8 @@ def extract_content_from_docx(doc: docx.Document) -> Tuple[List[Dict], List[Dict
         # Füge Text zum aktuellen Block hinzu (auch leere Zeilen behalten)
         current_block_text += text + "\n"
         
-        # Prüfe auf Fragebeginn
-        question_match = re.match(r'(\d+)\.\s*Frage:?\s*(.*)', text, re.IGNORECASE)
+        # Prüfe auf Fragebeginn (erlaube Einrückung)
+        question_match = re.match(r'^\s*(\d+)\.\s*Frage:?\s*(.*)', text, re.IGNORECASE)
         if question_match:
             # Wenn wir bereits eine Frage verarbeiten, speichere sie erst
             if current_question:
